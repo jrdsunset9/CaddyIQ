@@ -1,0 +1,41 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(unzip -o \"C:\\\\Users\\\\jrdsu\\\\Downloads\\\\Caddy-Iq.zip\" -d .)",
+      "Bash(unzip -l \"C:\\\\Users\\\\jrdsu\\\\Downloads\\\\Caddy-Iq.zip\")",
+      "Bash(grep -E \"\\\\.\\(tsx?|jsx?|html|css|json|md\\)$\")",
+      "Bash(grep -E \"\\\\.\\(tsx?|jsx?|html|css|json|md|env\\)$\")",
+      "Bash(cp -r Caddy-Iq/artifacts/caddyiq/* .)",
+      "Bash(cp -r Caddy-Iq/artifacts/api-server .)",
+      "Bash(unzip -o \"C:\\\\Users\\\\jrdsu\\\\Downloads\\\\Caddy-Iq.zip\" \"Caddy-Iq/artifacts/*\" -d .)",
+      "Bash(unzip -o \"C:\\\\Users\\\\jrdsu\\\\Downloads\\\\Caddy-Iq.zip\" \"Caddy-Iq/artifacts/caddyiq/*\" -d /tmp/caddy_extract)",
+      "Bash(unzip -o \"C:\\\\Users\\\\jrdsu\\\\Downloads\\\\Caddy-Iq.zip\" \"Caddy-Iq/artifacts/api-server/**\" -d /tmp/caddy_extract)",
+      "Bash(npm --version)",
+      "Read(//c/Program Files/**)",
+      "Read(//c/Users/jrdsu/AppData/Roaming/**)",
+      "Read(//c/Users/jrdsu/AppData/Local/**)",
+      "Read(//c/ProgramData/**)",
+      "Bash(cmd /c \"where node\")",
+      "Bash(cmd /c \"where npm\")",
+      "Bash(cmd /c \"where pnpm\")",
+      "Bash(cmd /c \"where node 2>&1\")",
+      "Read(//c/Users/jrdsu/**)",
+      "Read(//c/Program Files \\(x86\\)/**)",
+      "Read(//c/Users/jrdsu/scoop/apps/**)",
+      "Bash(unzip -o \"C:\\\\Users\\\\jrdsu\\\\Downloads\\\\Caddy-Iq.zip\" \"Caddy-Iq/pnpm-workspace.yaml\" \"Caddy-Iq/pnpm-lock.yaml\" \"Caddy-Iq/.npmrc\" \"Caddy-Iq/package.json\" -d /tmp/caddy_root)",
+      "Bash(unzip -o \"C:\\\\Users\\\\jrdsu\\\\Downloads\\\\Caddy-Iq.zip\" \"Caddy-Iq/lib/api-client-react/**\" -d /tmp/caddy_root)",
+      "Bash(cmd /c \"winget --version\")",
+      "Bash(cmd /c \"winget search nodejs 2>&1\")",
+      "Bash(powershell -Command \"winget install OpenJS.NodeJS.LTS --silent --accept-package-agreements --accept-source-agreements 2>&1\")",
+      "Bash(export PATH=\"$PATH:/c/Program Files/nodejs\")",
+      "Bash(npm install:*)",
+      "mcp__Claude_Preview__preview_start",
+      "Bash(xargs grep:*)",
+      "Bash(powershell -Command \"winget install Gyan.FFmpeg --silent --accept-package-agreements --accept-source-agreements 2>&1\")",
+      "Bash(powershell -Command \"Get-Command ffmpeg | Select-Object -ExpandProperty Source\")",
+      "Bash(cmd /c \"where ffmpeg\")",
+      "Bash(curl -s http://localhost:3001/api/healthz)",
+      "Bash(powershell -Command \"\\(Invoke-WebRequest -Uri 'http://localhost:3001/api/healthz'\\).Content\")"
+    ]
+  }
+}

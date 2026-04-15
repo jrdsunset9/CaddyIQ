@@ -1,0 +1,17 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "CaddyIQ",
+      "runtimeExecutable": "C:\\Users\\jrdsu\\OneDrive\\Documents\\CaddyIQ\\start-dev.bat",
+      "runtimeArgs": [],
+      "port": 3000
+    },
+    {
+      "name": "CaddyIQ API",
+      "runtimeExecutable": "C:\\Users\\jrdsu\\OneDrive\\Documents\\CaddyIQ\\start-api.bat",
+      "runtimeArgs": [],
+      "port": 3001
+    }
+  ]
+}
