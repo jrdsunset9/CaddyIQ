@@ -19,8 +19,19 @@ export default defineConfig({
     host: "0.0.0.0",
     proxy: {
       "/api": {
-        target: "http://localhost:3001",
+        target: "http://127.0.0.1:3001",
         changeOrigin: true,
+        configure: (proxy) => {
+          proxy.on("error", (err, _req, res) => {
+            console.error("[vite proxy] /api upstream error:", err.message);
+            if (res && "writeHead" in res && !res.headersSent) {
+              res.writeHead(502, { "Content-Type": "application/json" });
+              res.end(JSON.stringify({
+                error: "API server not reachable on :3001. Run start-dev.bat (it launches both).",
+              }));
+            }
+          });
+        },
       },
     },
   },

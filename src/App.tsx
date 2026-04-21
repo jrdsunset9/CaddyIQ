@@ -22,20 +22,55 @@ export interface FrameImage {
   position: string;
 }
 
+/** Annotation data returned by Claude — rendered as SVG overlay on the frame. */
+export interface AnnotationData {
+  type: "line" | "circle" | "arc" | "arrow" | "path";
+  description: string;
+  bodyPart: string;
+  color: "green" | "amber" | "white";
+  geometry: {
+    startDescription: string;
+    endDescription: string;
+    shape: string;
+  };
+}
+
+/** One coaching point — either a strength, a focused fix, or an extra observation. */
+export interface CoachingPoint {
+  positionLabel: string;           // e.g. "P4 — Top of backswing" or "Grip fault — Address"
+  frameIndex: number;              // exact index into frameImages[]
+  timestamp: number;               // exact timestamp in original video
+  status: "strength" | "focus-area" | "extra-observation";
+  observation: string;
+  coachingPriority: number;        // lower = fix first; strengths get 20+
+  // Fix-only fields (omitted for strengths):
+  title?: string;
+  description?: string;
+  proRef?: { player: string; comparison: string };
+  feelingCue?: string;
+  feelingCueCredit?: string;
+  practiceDrill?: { name: string; description: string; reps: string };
+  youtubeSearch?: { query: string; channel: string };
+  annotation?: AnnotationData;
+}
+
+/** A coaching-point frame enriched for the VideoPlayer thumbnail strip. */
+export interface SelectedFrame {
+  base64: string;
+  timestamp: number;
+  shortLabel: string;   // "P4" or "Grip"
+  fullLabel: string;    // "P4 — Top of backswing" or "Grip fault — Address"
+  status: "strength" | "focus-area" | "extra-observation";
+  pointIndex: number;   // index into coachingPoints[] array
+}
+
 export interface AnalysisResult {
   headline: string;
   openingMessage: string;
   whatsWorking: string[];
-  positionBreakdown: Array<{
-    position: string;
-    positionCode: string;
-    label: string;
-    timestamp: number;
-    frameIndex: number;
-    observation: string;
-    status: "strength" | "improving" | "focus-area";
-    coachNote: string;
-  }>;
+  /** New: dynamic 8-14 coaching points with annotations and priority ordering. */
+  coachingPoints?: CoachingPoint[];
+  /** Legacy: derived from coachingPoints for backward-compat with session history display. */
   fixes: Array<{
     priority: number;
     title: string;

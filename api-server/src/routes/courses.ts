@@ -4,6 +4,12 @@ import type { CourseData } from "../data/courses";
 
 const router: IRouter = Router();
 
+// Startup log — confirms the local course dataset was imported successfully
+console.log(`[courses] Local course database loaded: ${COURSES.length} courses`);
+if (COURSES.length === 0) {
+  console.warn("[courses] WARNING: COURSES array is empty — search will return nothing!");
+}
+
 const cache = new Map<string, { data: CourseData[]; ts: number }>();
 const CACHE_TTL = 60 * 60 * 1000;
 
@@ -56,9 +62,14 @@ async function searchExternal(q: string): Promise<CourseData[] | null> {
 }
 
 router.get("/courses", async (req, res) => {
-  const q = ((req.query.q as string) || "").trim().toLowerCase();
+  const rawQ = (req.query.q as string) || "";
+  const q = rawQ.trim().toLowerCase();
 
-  if (q.length < 2) {
+  console.log(`[courses] GET /api/courses?q="${rawQ}" → normalized="${q}" dbSize=${COURSES.length}`);
+
+  // Allow 1-char queries through (was previously blocking short queries like "a" or blank).
+  // Empty query still returns default list.
+  if (q.length === 0) {
     res.json({ courses: COURSES.slice(0, 12) });
     return;
   }
@@ -70,11 +81,16 @@ router.get("/courses", async (req, res) => {
     return;
   }
 
-  const local = COURSES.filter(c =>
-    c.name.toLowerCase().includes(q) ||
-    c.city.toLowerCase().includes(q) ||
-    c.state.toLowerCase() === q
-  );
+  // Case-insensitive match on BOTH sides — lowercase query AND lowercase course fields.
+  // Matches partial substrings on name and city (e.g. "pebb" → "Pebble Beach").
+  const local = COURSES.filter(c => {
+    const name  = (c.name  || "").toLowerCase();
+    const city  = (c.city  || "").toLowerCase();
+    const state = (c.state || "").toLowerCase();
+    return name.includes(q) || city.includes(q) || state === q || state.includes(q);
+  });
+
+  console.log(`[courses] Local matches for "${q}": ${local.length}`);
 
   let external: CourseData[] | null = null;
   if (local.length < 3) {

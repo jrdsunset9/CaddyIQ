@@ -19,9 +19,10 @@ export const F = {
 } as const;
 
 export const STATUS = {
-  "strength":   { color: "#2A6640", bg: "#EDF4EE", border: "#B7D9BE", label: "Strength" },
-  "improving":  { color: "#B45309", bg: "#FEF3E2", border: "#F5C98A", label: "Improving" },
-  "focus-area": { color: "#B45309", bg: "#FEF3E2", border: "#F5C98A", label: "Focus area" },
+  "strength":          { color: "#2A6640", bg: "#EDF4EE", border: "#B7D9BE", label: "Strength" },
+  "improving":         { color: "#B45309", bg: "#FEF3E2", border: "#F5C98A", label: "Improving" },
+  "focus-area":        { color: "#B45309", bg: "#FEF3E2", border: "#F5C98A", label: "Focus area" },
+  "extra-observation": { color: "#FFFFFF", bg: "rgba(255,255,255,0.08)", border: "rgba(255,255,255,0.35)", label: "Note" },
 } as const;
 
 export const card: React.CSSProperties = {
