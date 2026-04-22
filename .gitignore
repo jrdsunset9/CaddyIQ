@@ -5,3 +5,7 @@ dist/
 .env*.local
 api-server/node_modules/
 api-server/dist/
+
+# Build artifacts / large bundles — never commit
+*.zip
+Caddy-Iq.zip
