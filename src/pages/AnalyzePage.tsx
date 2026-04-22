@@ -11,14 +11,22 @@ import type {
 } from "../App";
 
 // ─── Loading state ────────────────────────────────────────────────────────────
+// Time-based progress messages so the user sees real forward motion during
+// the up-to-3-minute analysis window. Each entry fires when elapsed time
+// crosses its `startMs` threshold — prevents users from thinking the page
+// froze and refreshing (which kills the request).
 
-const LOADING_MESSAGES = [
-  "Uploading your swing...",
-  "Pass 1 — scanning 30 frames for the real swing...",
-  "Swing detected — filtering out pre-shot routine...",
-  "Pass 2 — extracting frames every 0.1 seconds...",
-  "Pass 3 — cross-referencing tour biomechanics...",
-  "Building your personalised coaching plan...",
+interface LoadingStage {
+  startMs: number;
+  message: string;
+}
+
+const LOADING_STAGES: LoadingStage[] = [
+  { startMs:     0, message: "Extracting swing frames..." },
+  { startMs: 15000, message: "Identifying swing positions..." },
+  { startMs: 30000, message: "Analyzing your technique..." },
+  { startMs: 60000, message: "Writing your coaching session..." },
+  { startMs: 90000, message: "Almost done — finalizing recommendations..." },
 ];
 
 // ─── Props ───────────────────────────────────────────────────────────────────
@@ -452,10 +460,20 @@ export default function AnalyzePage({
   const runAnalysis = async () => {
     if (!file) return;
     setError(""); setLoading(true); setLoadStep(0);
-    const iv = setInterval(
-      () => setLoadStep((s) => Math.min(s + 1, LOADING_MESSAGES.length - 1)),
-      3500,
-    );
+
+    // Time-based progress ticker — re-evaluates which stage we're in every
+    // second and sets loadStep to that stage's index. Each tick also counts
+    // as a heartbeat so the user can see the analysis is still running.
+    const startedAt = Date.now();
+    const iv = setInterval(() => {
+      const elapsed = Date.now() - startedAt;
+      let idx = 0;
+      for (let i = 0; i < LOADING_STAGES.length; i++) {
+        if (elapsed >= LOADING_STAGES[i].startMs) idx = i;
+      }
+      setLoadStep(idx);
+    }, 1000);
+
     try {
       const form = new FormData();
       form.append("swing", file);
@@ -464,9 +482,10 @@ export default function AnalyzePage({
       form.append("sessionHistory", JSON.stringify(sessionHistory));
       if (feelProfile) form.append("feelProfile", JSON.stringify(feelProfile));
 
-      // 2-minute timeout — video analysis can take 60-90s
+      // 3-minute timeout — split-call analysis (label + coach) + frame extraction
+      // can reach ~2 min on longer iPhone clips, so 180s leaves a safety margin.
       const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 120000);
+      const timeoutId = setTimeout(() => controller.abort(), 180000);
 
       let res: Response;
       try {
@@ -480,7 +499,7 @@ export default function AnalyzePage({
         clearInterval(iv);
         const fe = fetchErr as { name?: string; message?: string };
         if (fe?.name === "AbortError") {
-          throw new Error("Analysis timed out — the video took longer than 2 minutes. Try a shorter clip.");
+          throw new Error("Analysis timed out — the video took longer than 3 minutes. Try a shorter clip.");
         }
         throw new Error(`API connection failed: ${fe?.message || "could not reach the analysis server"}`);
       }
@@ -691,10 +710,10 @@ export default function AnalyzePage({
           Your coach is reviewing your swing
         </div>
         <div style={{ fontSize: 15, color: C.accentGreen, marginBottom: 28 }}>
-          {LOADING_MESSAGES[loadStep]}
+          {LOADING_STAGES[loadStep]?.message ?? LOADING_STAGES[0].message}
         </div>
         <div style={{ display: "flex", gap: 6, justifyContent: "center" }}>
-          {LOADING_MESSAGES.map((_, i) => (
+          {LOADING_STAGES.map((_, i) => (
             <div
               key={i}
               style={{

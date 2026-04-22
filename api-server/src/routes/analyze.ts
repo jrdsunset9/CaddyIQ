@@ -6,6 +6,7 @@ import os from "os";
 import { randomUUID } from "crypto";
 import { execSync } from "child_process";
 import ffmpeg from "fluent-ffmpeg";
+import sharp from "sharp";
 import Anthropic from "@anthropic-ai/sdk";
 
 function findFfmpeg(): string {
@@ -129,9 +130,9 @@ async function extractEvenFrames(
     ffmpeg(inputPath)
       .inputOptions([])
       .outputOptions([
-        "-vf", "fps=2.34,scale=1024:-2",
-        "-q:v", "5",
-        "-vframes", "10",
+        "-vf", "fps=2.34,scale=800:-2",
+        "-q:v", "8",
+        "-vframes", "6",
         "-map", "0:v:0",
       ])
       .output(outputPattern)
@@ -183,9 +184,9 @@ async function extractAtTimestamps(
       ffmpeg(inputPath)
         .inputOptions(["-ss", t.toString()])
         .outputOptions([
-          "-vf", "scale=1024:-2",
+          "-vf", "scale=800:-2",
           "-vframes", "1",
-          "-q:v", "5",
+          "-q:v", "8",
           "-map", "0:v:0",
         ])
         .output(outputPath)
@@ -227,8 +228,15 @@ async function extractAtTimestamps(
   };
 }
 
-function fileToBase64(p: string): string {
-  return fs.readFileSync(p).toString("base64");
+/** Resize a JPEG frame to 800px wide (keeping aspect ratio) via sharp, then
+ *  base64-encode it. Sharp is more efficient than raw readFileSync when we
+ *  want to guarantee payload size — it also strips any extra EXIF/metadata. */
+async function fileToBase64(p: string): Promise<string> {
+  const buf = await sharp(p)
+    .resize({ width: 800, withoutEnlargement: true })
+    .jpeg({ quality: 80 })
+    .toBuffer();
+  return buf.toString("base64");
 }
 
 function cleanup(...paths: string[]) {
@@ -260,28 +268,33 @@ interface FeelProfileData {
 
 type ContentBlock = Anthropic.Messages.ContentBlockParam;
 
-// ─── PASS 1 — Swing detection ─────────────────────────────────────────────────
+// ─── CALL 1 — Frame labeling (fast, small) ────────────────────────────────────
+//
+// Claude labels each of the 6 frames with a P1–P10 swing position and flags
+// whether the position is a `strength` or a `focus-area`. We then send only
+// the 2–3 focus-area frames into the heavy coaching call — avoiding re-analysis
+// of all 6 large images in the big prompt.
 
-async function detectSwingBounds(
+interface LabeledFrame {
+  frameIndex: number;
+  position:   string;
+  timestamp:  number;
+  status:     "strength" | "focus-area";
+}
+
+async function labelFrames(
   anthropic: Anthropic,
-  frames: Array<{ base64: string; timestamp: number }>,
-  videoDuration: number,
-): Promise<{ swingStart: number; swingEnd: number }> {
+  frames: Array<{ base64: string; timestamp: number; index: number }>,
+): Promise<LabeledFrame[]> {
   const content: ContentBlock[] = [];
 
   content.push({
     type: "text",
-    text: `You are analyzing a golf swing video. These ${frames.length} frames are evenly spaced across the full video (frame 0 to frame ${frames.length - 1}). Your job is to find the actual golf swing and ignore everything else — pre-shot routine, waggle, practice moves, looking at target, walking into address.
-
-The real swing starts when the club makes a COMMITTED move away from the ball (not a waggle — an actual takeaway). The swing ends when the golfer reaches a balanced finish position.
-
-If multiple swings appear, use the LAST complete swing only.
-
-Return ONLY a JSON object: { "swing_start_frame": <0-${frames.length - 1}>, "swing_end_frame": <0-${frames.length - 1}> }`,
+    text: `Label each frame with its swing position P1-P10. Return only JSON: [{frameIndex, position, timestamp, status: strength|focus-area}]`,
   });
 
-  frames.forEach(({ base64, timestamp }, i) => {
-    content.push({ type: "text", text: `Frame ${i} (${timestamp.toFixed(3)}s):` });
+  frames.forEach(({ base64, timestamp, index }) => {
+    content.push({ type: "text", text: `Frame ${index} (${timestamp.toFixed(3)}s):` });
     content.push({
       type: "image",
       source: { type: "base64", media_type: "image/jpeg", data: base64 },
@@ -290,32 +303,54 @@ Return ONLY a JSON object: { "swing_start_frame": <0-${frames.length - 1}>, "swi
 
   const res = await anthropic.messages.create({
     model: "claude-sonnet-4-6",
-    max_tokens: 256,
+    max_tokens: 300,
     messages: [{ role: "user", content }],
   });
 
   const raw = res.content.find((b) => b.type === "text")?.text ?? "";
-  try {
-    const m = raw.match(/\{[\s\S]*?\}/);
-    if (m) {
-      const parsed = JSON.parse(m[0]) as {
-        swing_start_frame?: number;
-        swing_end_frame?: number;
-      };
-      const si = Math.max(0, Math.min(frames.length - 1, parsed.swing_start_frame ?? 0));
-      const ei = Math.max(0, Math.min(frames.length - 1, parsed.swing_end_frame ?? frames.length - 1));
-      const swingStart = frames[si]?.timestamp ?? 0;
-      const swingEnd   = frames[ei]?.timestamp ?? videoDuration;
-      if (swingEnd > swingStart + 0.3) return { swingStart, swingEnd };
-    }
-  } catch {}
 
-  return { swingStart: 0, swingEnd: videoDuration };
+  // Try strict parse, then array-extract fallback.
+  const tryParse = (s: string): LabeledFrame[] | null => {
+    try {
+      const j = JSON.parse(s);
+      if (Array.isArray(j)) {
+        return j.map((o: Record<string, unknown>) => ({
+          frameIndex: Number(o.frameIndex ?? 0),
+          position:   String(o.position ?? ""),
+          timestamp:  Number(o.timestamp ?? 0),
+          status:     (o.status === "focus-area" ? "focus-area" : "strength") as LabeledFrame["status"],
+        }));
+      }
+    } catch {}
+    return null;
+  };
+
+  const cleaned = raw.replace(/```json\n?|```\n?/g, "").trim();
+  const parsed  = tryParse(cleaned) ?? (() => {
+    const m = cleaned.match(/\[[\s\S]*\]/);
+    return m ? tryParse(m[0]) : null;
+  })();
+
+  if (parsed && parsed.length > 0) return parsed;
+
+  // Fallback: treat all frames as focus-area so the pipeline still produces output.
+  return frames.map((f) => ({
+    frameIndex: f.index,
+    position:   `P${f.index + 1}`,
+    timestamp:  f.timestamp,
+    status:     "focus-area",
+  }));
 }
 
 // ─── Route ───────────────────────────────────────────────────────────────────
 
 router.post("/analyze", upload.single("swing"), async (req, res) => {
+  // Extend both ends of the socket to 3 minutes — ffmpeg + two Claude calls
+  // can occasionally push past the Node default of 0 (no limit) on some hosts,
+  // and Express downstream timeouts would otherwise chop the response short.
+  req.setTimeout(180000);
+  res.setTimeout(180000);
+
   const uploadedPath = req.file?.path;
   let detectFrameDir: string | null = null;
   let swingFrameDir:  string | null = null;
@@ -348,7 +383,12 @@ router.post("/analyze", upload.single("swing"), async (req, res) => {
       try { playerFeelProfile = JSON.parse(feelProfile); } catch {}
     }
 
-    const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+    // 150s Anthropic SDK timeout leaves ~30s buffer before the 180s client/server
+    // socket deadline fires, so the user sees a clean error rather than a blank abort.
+    const anthropic = new Anthropic({
+      apiKey:  process.env.ANTHROPIC_API_KEY,
+      timeout: 150000,
+    });
 
     const isVideo =
       req.file.mimetype.startsWith("video/") ||
@@ -368,54 +408,57 @@ router.post("/analyze", upload.single("swing"), async (req, res) => {
     if (isVideo) {
       videoDuration = await getVideoDuration(uploadedPath!);
 
-      // ── PASS 1: 30 frames evenly across video — find the real swing ──
-      const detectResult = await extractEvenFrames(uploadedPath!, 30, videoDuration);
+      // ── EXTRACT: 6 frames evenly across the video (800px wide, q:v 8) ──
+      const detectResult = await extractEvenFrames(uploadedPath!, 6, videoDuration);
       detectFrameDir = detectResult.frameDir;
 
-      const detectFrames = detectResult.files.map((f, i) => ({
-        base64:    fileToBase64(f),
-        timestamp: detectResult.timestamps[i] ?? 0,
-      }));
+      const allFrames = await Promise.all(
+        detectResult.files.map(async (f, i) => ({
+          base64:    await fileToBase64(f),
+          timestamp: detectResult.timestamps[i] ?? 0,
+          index:     i,
+        })),
+      );
 
-      req.log.info({ count: detectFrames.length }, "Pass 1: swing detection");
+      req.log.info({ count: allFrames.length }, "Extracted 6 frames for labeling");
 
-      const bounds = await detectSwingBounds(anthropic, detectFrames, videoDuration);
-      swingStart = bounds.swingStart;
-      swingEnd   = bounds.swingEnd;
+      // ── CALL 1: Label each frame P1–P10, mark status ──
+      const labeled = await labelFrames(anthropic, allFrames);
+      req.log.info({ labeled: labeled.length }, "Call 1: frames labeled");
 
-      req.log.info({ swingStart, swingEnd }, "Swing bounds detected");
+      // Focus-area frames are the problem spots — these are the only frames
+      // we send to the heavy coaching call. Cap at 3 to keep Call 2 small.
+      const focusIndices = new Set(
+        labeled.filter((l) => l.status === "focus-area").slice(0, 3).map((l) => l.frameIndex),
+      );
 
-      // ── PASS 2: one frame every 0.1s across the detected swing ──
-      const swingTimestamps: number[] = [];
-      for (
-        let t = swingStart;
-        t <= swingEnd + 0.001;
-        t = parseFloat((t + 0.1).toFixed(3))
-      ) {
-        swingTimestamps.push(parseFloat(Math.min(t, swingEnd).toFixed(3)));
+      // Fallback: if Call 1 didn't flag anything as focus-area, fall back to
+      // a spread of 3 frames across the 6 so Call 2 always has something to work on.
+      let selected = allFrames.filter((f) => focusIndices.has(f.index));
+      if (selected.length === 0) {
+        selected = [allFrames[1], allFrames[3], allFrames[5]].filter(Boolean) as typeof allFrames;
       }
-      // Cap at 60 frames for safety / API cost
-      const cappedTs = swingTimestamps.slice(0, 60);
 
-      const swingResult = await extractAtTimestamps(uploadedPath!, cappedTs);
-      swingFrameDir = swingResult.frameDir;
-
-      // swingResult.timestamps only contains the timestamps that successfully
-      // extracted — stay aligned with that instead of the originally-requested list.
-      swingFrames = swingResult.files.map((f, i) => ({
-        base64:    fileToBase64(f),
-        timestamp: swingResult.timestamps[i] ?? 0,
-        index:     i,
+      // Re-label selected frames with their P-position from Call 1 for downstream use.
+      const labelByIndex = new Map(labeled.map((l) => [l.frameIndex, l]));
+      swingFrames = selected.map((f, i) => ({
+        base64:    f.base64,
+        timestamp: labelByIndex.get(f.index)?.timestamp ?? f.timestamp,
+        index:     i, // reindex 0..(n-1) so prompt frameMap stays aligned with sent images
       }));
+
+      // Derive swing window from the first/last selected frame timestamps for UI.
+      swingStart = swingFrames[0]?.timestamp ?? 0;
+      swingEnd   = swingFrames[swingFrames.length - 1]?.timestamp ?? videoDuration;
 
       req.log.info(
         { frames: swingFrames.length, swingStart, swingEnd },
-        "Pass 2: swing frames extracted",
+        "Call 2 input: focus-area frames",
       );
     } else {
       // Single image
       swingFrames = [{
-        base64:    fileToBase64(uploadedPath!),
+        base64:    await fileToBase64(uploadedPath!),
         timestamp: 0,
         index:     0,
       }];
@@ -443,7 +486,9 @@ Reference these naturally — e.g. "You mentioned feeling stuck on the downswing
             .join("\n")}`
         : "\n\nThis is the golfer's FIRST session — no history yet.";
 
-    const MAX_FRAMES = 8;
+    // Hard safety cap — the 2-call flow already limits focus-area to 3, but
+    // belt-and-suspenders in case someone changes that selection logic later.
+    const MAX_FRAMES = 3;
     if (swingFrames.length > MAX_FRAMES) {
       swingFrames = swingFrames.slice(0, MAX_FRAMES);
     }
@@ -607,7 +652,7 @@ CRITICAL RULES:
 
     messageContent.push({
       type: "text",
-      text: "Analyze all frames and return your complete coaching JSON. 8–14 coaching points, exact frameIndex and timestamp values, coachingPriority follows the fundamentals order, all feeling cues are original CaddyIQ voice with credit lines, every fix has youtubeSearch.",
+      text: "Analyze all frames and return your complete coaching JSON. 8–14 coaching points, exact frameIndex and timestamp values, coachingPriority follows the fundamentals order, all feeling cues are original CaddyIQ voice with credit lines, every fix has youtubeSearch. Provide exactly 2 priority fixes — the two most impactful changes only. Quality over quantity. Be concise in all string values. Keep each description under 100 words. Keep feeling cues under 50 words. This keeps the JSON response within token limits.",
     });
 
     req.log.info({ frames: swingFrames.length }, "Pass 3: sending to Claude");
@@ -616,7 +661,7 @@ CRITICAL RULES:
     try {
       claudeRes = await anthropic.messages.create({
         model: "claude-sonnet-4-6",
-        max_tokens: 8192,
+        max_tokens: 4000,
         messages: [{ role: "user", content: messageContent }],
       });
     } catch (apiErr: unknown) {
@@ -647,15 +692,36 @@ CRITICAL RULES:
     }
 
     const rawText = claudeRes.content.find((b) => b.type === "text")?.text ?? "";
+
+    // Diagnostic logging — if Claude truncates mid-JSON we need to see exactly
+    // where the response was cut off so we can tune max_tokens or the prompt.
+    console.log("Claude response length:", rawText.length, "chars");
+    console.log("First 200 chars:", rawText.slice(0, 200));
+    console.log("Last 200 chars:", rawText.slice(-200));
+
     const cleaned = rawText.replace(/```json\n?|```\n?/g, "").trim();
 
     let parsed: Record<string, unknown>;
     try {
       parsed = JSON.parse(cleaned);
-    } catch {
-      const m = cleaned.match(/\{[\s\S]*\}/);
-      if (m) parsed = JSON.parse(m[0]);
-      else throw new Error("Could not parse AI response as JSON");
+    } catch (e) {
+      const parseErr = e as Error;
+      // Try to salvage truncated JSON by finding the last complete object
+      // before the cut and closing the enclosing structure.
+      const lastBrace   = cleaned.lastIndexOf("},");
+      const lastBracket = cleaned.lastIndexOf("]");
+      if (lastBrace > 0 || lastBracket > 0) {
+        try {
+          const truncated = cleaned.substring(0, Math.max(lastBrace, lastBracket) + 1);
+          const salvaged  = truncated + "]}";
+          parsed = JSON.parse(salvaged);
+          console.log("Warning: JSON was truncated, salvaged partial response");
+        } catch {
+          throw new Error("Claude response was cut off mid-JSON. Position: " + parseErr.message);
+        }
+      } else {
+        throw new Error("Could not parse Claude response: " + parseErr.message);
+      }
     }
 
     // ── Derive `fixes` array for backward-compat with session history display ──

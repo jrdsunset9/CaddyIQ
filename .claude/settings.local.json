@@ -106,7 +106,11 @@
       "Bash(taskkill //F //PID 30124)",
       "Bash(npm run *)",
       "Bash(taskkill //F //PID 23424)",
-      "Bash(taskkill //F //PID 32304)"
+      "Bash(taskkill //F //PID 32304)",
+      "Bash(taskkill //F //PID 27584)",
+      "Bash(node -e \"const s=require\\('fs'\\).readFileSync\\('.env','utf8'\\); const l=s.split\\(/\\\\r?\\\\n/\\).find\\(x=>x.startsWith\\('ANTHROPIC_API_KEY='\\)\\); if\\(!l\\){console.log\\('no ANTHROPIC_API_KEY line'\\);process.exit\\(1\\)} const v=l.split\\('='\\).slice\\(1\\).join\\('='\\).replace\\(/^[\\\\\"'']|[\\\\\"'']$/g,''\\).trim\\(\\); console.log\\('prefix:', v.slice\\(0,12\\)\\); console.log\\('length:', v.length\\); console.log\\('looks like sk-ant-api03 format:', v.startsWith\\('sk-ant-api03-'\\)\\);\")",
+      "Bash(node -e \"try{require.resolve\\('sharp'\\);console.log\\('sharp: installed'\\)}catch{console.log\\('sharp: MISSING'\\)}\")",
+      "Bash(node -e \"try{require.resolve\\('connect-timeout'\\);console.log\\('connect-timeout: installed'\\)}catch{console.log\\('connect-timeout: MISSING'\\)}\")"
     ]
   }
 }
