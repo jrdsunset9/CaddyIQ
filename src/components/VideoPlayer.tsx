@@ -1,6 +1,12 @@
-import { useRef, useState, useEffect, useCallback } from "react";
+import { useRef, useState, useEffect, useCallback, forwardRef, useImperativeHandle } from "react";
 import { C, F, STATUS } from "../design";
 import type { SelectedFrame } from "../App";
+
+/** Imperative handle exposed by VideoPlayer so parents can seek the video
+ * from outside the component (e.g. when a coaching card is tapped). */
+export interface VideoPlayerHandle {
+  seekTo: (timestamp: number) => void;
+}
 
 export interface MarkedPosition {
   position: string;
@@ -31,14 +37,14 @@ interface Props {
   onFrameClick?: (pointIndex: number) => void;
 }
 
-export default function VideoPlayer({
+const VideoPlayer = forwardRef<VideoPlayerHandle, Props>(function VideoPlayer({
   videoUrl,
   duration,
   frameTimestamps,
   positions,
   selectedFrames = [],
   onFrameClick,
-}: Props) {
+}, ref) {
   const videoRef   = useRef<HTMLVideoElement>(null);
   const thumbRefs  = useRef<(HTMLDivElement | null)[]>([]);
   const [currentTime, setCurrentTime] = useState(0);
@@ -75,6 +81,9 @@ export default function VideoPlayer({
       setPlaying(false);
     }
   };
+
+  // Expose seekTo to parent so coaching cards can drive the video.
+  useImperativeHandle(ref, () => ({ seekTo }), []);
 
   const handleThumbClick = (i: number) => {
     const frame = selectedFrames[i];
@@ -310,4 +319,6 @@ export default function VideoPlayer({
       )}
     </div>
   );
-}
+});
+
+export default VideoPlayer;

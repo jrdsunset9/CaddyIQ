@@ -1,14 +1,15 @@
-import { useState, useRef, useCallback, useId } from "react";
+import { useState, useRef, useCallback } from "react";
 import { C, F } from "../design";
-import VideoPlayer, { MarkedPosition } from "../components/VideoPlayer";
+import VideoPlayer, { type MarkedPosition, type VideoPlayerHandle } from "../components/VideoPlayer";
 import type {
   SessionMemory,
   FeelProfile,
   AnalysisResult,
   CoachingPoint,
-  AnnotationData,
+  CheckinResponse,
   SelectedFrame,
 } from "../App";
+import { computeCareerSummary, formatAnalyticsForPrompt, type Round } from "../lib/analytics";
 
 // ─── Loading state ────────────────────────────────────────────────────────────
 // Time-based progress messages so the user sees real forward motion during
@@ -34,159 +35,39 @@ const LOADING_STAGES: LoadingStage[] = [
 interface Props {
   feelProfile: FeelProfile | null;
   sessionHistory: SessionMemory[];
+  checkinResponses: CheckinResponse[];
+  roundHistory: Round[];
+  onCheckinSaved: (r: CheckinResponse) => void;
   onSessionSaved: (s: SessionMemory) => void;
-  onSwitchTab: (t: "round" | "analyze" | "sessions" | "drills") => void;
+  onSwitchTab: (t: "round" | "analyze" | "sessions" | "drills" | "analytics") => void;
 }
 
-// ─── SVG Annotation overlay ───────────────────────────────────────────────────
+// ─── Frame lookup helper (CHANGE 2) ───────────────────────────────────────────
 
-/** Maps a natural-language position description to percentage coords [0–100, 0–100]. */
-function descToCoord(desc: string): [number, number] {
-  const d = desc.toLowerCase();
-  if (d.includes("upper left")  || d.includes("top left"))     return [15, 15];
-  if (d.includes("upper right") || d.includes("top right"))    return [85, 15];
-  if (d.includes("lower left")  || d.includes("bottom left"))  return [15, 85];
-  if (d.includes("lower right") || d.includes("bottom right")) return [85, 85];
-  if (d.includes("top center")  || d.includes("upper center")) return [50, 10];
-  if (d.includes("bottom center")|| d.includes("lower center"))return [50, 90];
-  if (d.includes("left edge"))  return [5, 50];
-  if (d.includes("right edge")) return [95, 50];
-  if (d.includes("mid left"))   return [18, 50];
-  if (d.includes("mid right"))  return [82, 50];
-  if (d.includes("center"))     return [50, 50];
-  // Golf body parts (face-on view approximations)
-  if (d.includes("club head"))                                 return [45, 12];
-  if (d.includes("grip end") || d.includes("butt of club"))   return [55, 60];
-  if (d.includes("club shaft"))                                return [50, 35];
-  if (d.includes("lead shoulder") || d.includes("left shoulder")) return [38, 28];
-  if (d.includes("trail shoulder")|| d.includes("right shoulder"))return [62, 28];
-  if (d.includes("shoulder line") || d.includes("shoulders")) return [50, 28];
-  if (d.includes("lead elbow")  || d.includes("left elbow"))  return [35, 42];
-  if (d.includes("trail elbow") || d.includes("right elbow")) return [65, 42];
-  if (d.includes("lead arm")    || d.includes("left arm"))    return [36, 38];
-  if (d.includes("trail arm")   || d.includes("right arm"))   return [64, 38];
-  if (d.includes("lead hip")    || d.includes("left hip"))    return [40, 62];
-  if (d.includes("trail hip")   || d.includes("right hip"))   return [60, 62];
-  if (d.includes("hip line")    || d.includes("hips"))        return [50, 62];
-  if (d.includes("spine angle") || d.includes("spine"))       return [50, 45];
-  if (d.includes("lead knee")   || d.includes("left knee"))   return [38, 78];
-  if (d.includes("trail knee")  || d.includes("right knee"))  return [62, 78];
-  if (d.includes("lead foot")   || d.includes("left foot"))   return [38, 92];
-  if (d.includes("trail foot")  || d.includes("right foot"))  return [62, 92];
-  if (d.includes("ball")        || d.includes("address"))     return [50, 88];
-  if (d.includes("head") && !d.includes("club"))              return [50, 12];
-  if (d.includes("face") || d.includes("chin"))               return [50, 16];
-  if (d.includes("grip") || d.includes("hands"))              return [52, 57];
-  return [50, 50];
-}
-
-function AnnotatedFrame({
-  base64,
-  annotation,
-  style = {},
-}: {
-  base64: string;
-  annotation?: AnnotationData;
-  style?: React.CSSProperties;
-}) {
-  const uid = useId().replace(/:/g, "");
-
-  const color =
-    !annotation ? "transparent"
-    : annotation.color === "green" ? "#2A6640"
-    : annotation.color === "amber" ? "#B45309"
-    : "rgba(255,255,255,0.75)";
-
-  const renderShape = () => {
-    if (!annotation) return null;
-    const [sx, sy] = descToCoord(annotation.geometry.startDescription);
-    const [ex, ey] = descToCoord(annotation.geometry.endDescription);
-
-    switch (annotation.type) {
-      case "line":
-        return (
-          <line
-            x1={sx} y1={sy} x2={ex} y2={ey}
-            stroke={color} strokeWidth="2.5" strokeOpacity="0.9"
-            strokeLinecap="round"
-          />
-        );
-      case "circle": {
-        const cx = (sx + ex) / 2;
-        const cy = (sy + ey) / 2;
-        const r  = Math.max(
-          5,
-          Math.sqrt((ex - sx) ** 2 + (ey - sy) ** 2) / 2,
-        );
-        return (
-          <circle
-            cx={cx} cy={cy} r={r}
-            fill="none" stroke={color} strokeWidth="2.5" strokeOpacity="0.9"
-          />
-        );
-      }
-      case "arc":
-      case "arrow": {
-        const dx  = ex - sx;
-        const dy  = ey - sy;
-        const mx  = sx + dx * 0.5 - dy * 0.25;
-        const my  = sy + dy * 0.5 + dx * 0.25;
-        return (
-          <>
-            <defs>
-              <marker
-                id={`arr-${uid}`} markerWidth="8" markerHeight="8"
-                refX="6" refY="3" orient="auto"
-              >
-                <path d="M0 0 L0 6 L8 3 z" fill={color} />
-              </marker>
-            </defs>
-            <path
-              d={`M ${sx} ${sy} Q ${mx} ${my} ${ex} ${ey}`}
-              fill="none" stroke={color} strokeWidth="2.5" strokeOpacity="0.9"
-              markerEnd={`url(#arr-${uid})`}
-            />
-          </>
-        );
-      }
-      case "path": {
-        const t1x = sx + (ex - sx) * 0.33;
-        const t1y = sy + (ey - sy) * 0.33 - 8;
-        const t2x = sx + (ex - sx) * 0.66;
-        const t2y = sy + (ey - sy) * 0.66 + 8;
-        return (
-          <path
-            d={`M ${sx} ${sy} C ${t1x} ${t1y} ${t2x} ${t2y} ${ex} ${ey}`}
-            fill="none" stroke={color} strokeWidth="2.5" strokeOpacity="0.9"
-          />
-        );
-      }
-      default:
-        return null;
+/** Look up a frame by exact frameIndex; if missing or out of range, return the
+ * closest available frame by timestamp. Guarantees a real image rather than a
+ * placeholder so coaching points always render against something visual. */
+function resolveFrame(
+  frameImages: AnalysisResult["frameImages"],
+  frameIndex: number,
+  timestamp?: number,
+): AnalysisResult["frameImages"][number] | null {
+  if (!frameImages || frameImages.length === 0) return null;
+  if (frameIndex >= 0 && frameIndex < frameImages.length) {
+    return frameImages[frameIndex];
+  }
+  // Fallback: closest frame by timestamp if provided, else clamp to range.
+  if (typeof timestamp === "number") {
+    let best = frameImages[0];
+    let bestDelta = Math.abs((best.timestamp ?? 0) - timestamp);
+    for (const f of frameImages) {
+      const delta = Math.abs((f.timestamp ?? 0) - timestamp);
+      if (delta < bestDelta) { best = f; bestDelta = delta; }
     }
-  };
-
-  return (
-    <div style={{ position: "relative", lineHeight: 0, borderRadius: 8, overflow: "hidden", ...style }}>
-      <img
-        src={`data:image/jpeg;base64,${base64}`}
-        alt="Swing frame"
-        style={{ width: "100%", display: "block" }}
-      />
-      {annotation && (
-        <svg
-          viewBox="0 0 100 100"
-          preserveAspectRatio="none"
-          style={{
-            position: "absolute", top: 0, left: 0,
-            width: "100%", height: "100%", pointerEvents: "none",
-          }}
-        >
-          {renderShape()}
-        </svg>
-      )}
-    </div>
-  );
+    return best;
+  }
+  const clamped = Math.max(0, Math.min(frameImages.length - 1, frameIndex));
+  return frameImages[clamped] ?? null;
 }
 
 // ─── Shared sub-components ────────────────────────────────────────────────────
@@ -247,19 +128,26 @@ function FixCard({
   point,
   frameImages,
   cardRef,
+  onSeek,
 }: {
   point: CoachingPoint;
   frameImages: AnalysisResult["frameImages"];
   cardRef?: (el: HTMLDivElement | null) => void;
+  /** Called when the user taps the frame image or position label —
+   * tells the page-level video player to seek to this card's moment. */
+  onSeek?: (timestamp: number) => void;
 }) {
   const isExtra = point.status === "extra-observation";
   const accent  = isExtra ? "#5C5445" : C.warning;
   const badge   = isExtra ? "Key Observation" : "Priority Fix";
 
-  const frame = frameImages[point.frameIndex] ?? null;
+  const frame = resolveFrame(frameImages, point.frameIndex, point.timestamp);
   const ytQuery = point.youtubeSearch?.query
     ? encodeURIComponent(point.youtubeSearch.query)
     : null;
+  const seekHere = () => {
+    if (onSeek && typeof point.timestamp === "number") onSeek(point.timestamp);
+  };
 
   return (
     <Card
@@ -279,7 +167,15 @@ function FixCard({
         }}>
           {badge}
         </div>
-        <div style={{ fontSize: 11, color: C.muted, textAlign: "right" as const }}>
+        <div
+          style={{
+            fontSize: 11, color: C.muted, textAlign: "right" as const,
+            cursor: onSeek ? "pointer" : "default",
+            textDecoration: onSeek ? "underline dotted" : "none",
+          }}
+          onClick={seekHere}
+          title={onSeek ? "Tap to jump video to this moment" : undefined}
+        >
           {point.positionLabel}
           {point.timestamp != null ? ` · ${point.timestamp.toFixed(1)}s` : ""}
         </div>
@@ -295,13 +191,22 @@ function FixCard({
         </div>
       )}
 
-      {/* 3. Annotated frame — full width */}
+      {/* 3. Frame — tap to seek video to this exact timestamp */}
       {frame && (
-        <AnnotatedFrame
-          base64={frame.base64}
-          annotation={point.annotation}
-          style={{ marginBottom: 14 }}
-        />
+        <div
+          style={{
+            lineHeight: 0, borderRadius: 8, overflow: "hidden",
+            marginBottom: 14, cursor: onSeek ? "pointer" : "default",
+          }}
+          onClick={seekHere}
+          title={onSeek ? "Tap to jump video to this frame" : undefined}
+        >
+          <img
+            src={`data:image/jpeg;base64,${frame.base64}`}
+            alt={`${point.positionLabel} — frame at ${point.timestamp?.toFixed(2)}s`}
+            style={{ width: "100%", display: "block" }}
+          />
+        </div>
       )}
 
       {/* 4. Description */}
@@ -424,6 +329,9 @@ function FixCard({
 export default function AnalyzePage({
   feelProfile,
   sessionHistory,
+  checkinResponses,
+  roundHistory,
+  onCheckinSaved,
   onSessionSaved,
 }: Props) {
   const [file,        setFile]        = useState<File | null>(null);
@@ -435,9 +343,15 @@ export default function AnalyzePage({
   const [result,      setResult]      = useState<AnalysisResult | null>(null);
   const [error,       setError]       = useState("");
   const [dragging,    setDragging]    = useState(false);
+  const [checkinDone, setCheckinDone] = useState(false);
   const fileRef     = useRef<HTMLInputElement>(null);
   // Refs keyed by coaching point index (in sorted order) for scroll-to
   const cardRefs    = useRef<Map<number, HTMLDivElement>>(new Map());
+  // Imperative handle on the video player so coaching cards can seek the video
+  const playerRef   = useRef<VideoPlayerHandle>(null);
+  const seekVideo = useCallback((t: number) => {
+    playerRef.current?.seekTo(t);
+  }, []);
 
   const handleFile = useCallback(
     (f: File) => {
@@ -479,8 +393,32 @@ export default function AnalyzePage({
       form.append("swing", file);
       form.append("swingType", "Full swing");
       form.append("notes", notes || "none");
-      form.append("sessionHistory", JSON.stringify(sessionHistory));
+
+      // Strip the heavy `analysis` field (which carries base64 frameImages)
+      // and cap to the most-recent 5 sessions before posting. The backend
+      // only references date/swingType/headline/faults/improvements/weeklyFocus
+      // for context — uploading 5 sessions × ~200 KB of base64 frames was
+      // tripping multer's 1 MB field-size cap with "field value too long."
+      const slimSessionHistory = sessionHistory.slice(0, 5).map((s) => ({
+        id: s.id,
+        date: s.date,
+        swingType: s.swingType,
+        headline: s.headline,
+        faultsIdentified: s.faultsIdentified,
+        improvementsNoted: s.improvementsNoted,
+        weeklyFocus: s.weeklyFocus,
+      }));
+      form.append("sessionHistory", JSON.stringify(slimSessionHistory));
+      form.append("checkinHistory", JSON.stringify(checkinResponses.slice(0, 30)));
       if (feelProfile) form.append("feelProfile", JSON.stringify(feelProfile));
+
+      // Analytics context — computed from round history so the AI can weight
+      // coaching advice toward the player's weakest Strokes Gained area.
+      if (roundHistory && roundHistory.length > 0) {
+        const summary = computeCareerSummary(roundHistory);
+        const block = formatAnalyticsForPrompt(summary, roundHistory);
+        if (block) form.append("analyticsSummary", block);
+      }
 
       // 3-minute timeout — split-call analysis (label + coach) + frame extraction
       // can reach ~2 min on longer iPhone clips, so 180s leaves a safety margin.
@@ -505,18 +443,31 @@ export default function AnalyzePage({
       }
       clearTimeout(timeoutId);
 
+      // Read as text first so we can surface the actual server message even
+      // if it isn't JSON (e.g. an HTML error page from an upstream proxy).
+      const bodyText = await res.text();
       let data: { success?: boolean; error?: string; analysis?: AnalysisResult };
       try {
-        data = await res.json();
+        data = bodyText ? JSON.parse(bodyText) : {};
       } catch {
         clearInterval(iv);
-        throw new Error(`Analysis failed (HTTP ${res.status}) — server returned an invalid response.`);
+        // Strip HTML tags and trim so the user sees the human-readable bit.
+        const stripped = bodyText
+          .replace(/<style[\s\S]*?<\/style>/gi, "")
+          .replace(/<script[\s\S]*?<\/script>/gi, "")
+          .replace(/<[^>]+>/g, " ")
+          .replace(/\s+/g, " ")
+          .trim();
+        const preview = stripped.slice(0, 240) || "(empty body)";
+        throw new Error(
+          `Analysis failed (HTTP ${res.status}) — ${preview}${stripped.length > 240 ? "…" : ""}`,
+        );
       }
       clearInterval(iv);
       if (!res.ok || !data.success) {
         const serverMsg = data.error || `Analysis failed (HTTP ${res.status})`;
         // Map common backend phrases to clearer user messages
-        if (/too large|payload/i.test(serverMsg))      throw new Error("Video too large — please upload a smaller file (under 500 MB).");
+        if (/too large|payload/i.test(serverMsg))      throw new Error("Video too large — please upload a smaller file (under 200 MB).");
         if (/timed out|timeout/i.test(serverMsg))      throw new Error("Analysis timed out — try a shorter clip.");
         if (/authentication|API key|api_key/i.test(serverMsg)) throw new Error("API connection failed — the server is missing its API key.");
         throw new Error(serverMsg);
@@ -566,6 +517,40 @@ export default function AnalyzePage({
       border: "none", borderRadius: 8, fontSize: 15, fontWeight: 600,
     };
 
+    // ── Check-in card (CHANGE 4A) ──
+    // Shown only when at least one previous session exists AND we don't
+    // already have a check-in recorded for the most recent session's focus
+    // dated today. Normalizes focus via lowercase+punctuation-strip so small
+    // wording drift from Claude doesn't cause the card to reappear after
+    // answering.
+    const normFocus = (s: string) =>
+      s.trim().toLowerCase().replace(/[^\w\s]/g, "").replace(/\s+/g, " ");
+    const lastSession = sessionHistory[0];
+    const lastFocus   = lastSession?.weeklyFocus?.trim() || "";
+    const lastFocusKey = normFocus(lastFocus);
+    const today = new Date().toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" });
+    const alreadyAnsweredThisFocus =
+      checkinDone ||
+      (lastFocusKey && checkinResponses.some(
+        (r) => normFocus(r.focus) === lastFocusKey && r.date === today,
+      ));
+    const showCheckin = sessionHistory.length >= 1 && lastFocus && !alreadyAnsweredThisFocus;
+
+    const recordCheckin = (response: "improving" | "struggling" | "not_yet") => {
+      onCheckinSaved({
+        date: new Date().toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" }),
+        focus: lastFocus,
+        response,
+      });
+      setCheckinDone(true);
+    };
+
+    const checkinBtn = (bg: string, color: string): React.CSSProperties => ({
+      flex: 1, padding: "10px 8px", borderRadius: 8,
+      border: `1px solid ${color}`, background: bg, color,
+      fontSize: 13, fontWeight: 600, lineHeight: 1.3, cursor: "pointer",
+    });
+
     return (
       <div style={{ maxWidth: 680, margin: "0 auto", padding: "24px 16px" }}>
         <div style={{ fontFamily: F.serif, fontSize: 24, color: C.deepGreen, marginBottom: 4 }}>
@@ -574,6 +559,46 @@ export default function AnalyzePage({
         <div style={{ fontSize: 14, color: C.muted, marginBottom: 20 }}>
           Upload a video and get tour-level coaching in seconds
         </div>
+
+        {showCheckin && (
+          <div style={{
+            border: "1px solid #E8E4DC", borderRadius: 12, padding: 16,
+            background: "#fff", marginBottom: 16,
+          }}>
+            <div style={{
+              fontSize: 10, color: C.muted, textTransform: "uppercase",
+              letterSpacing: "0.1em", marginBottom: 8,
+            }}>
+              Since last session
+            </div>
+            <div style={{ fontFamily: F.serif, fontSize: 16, color: C.deepGreen, lineHeight: 1.4, marginBottom: 4 }}>
+              Last week's focus: <span style={{ fontStyle: "italic" }}>{lastFocus}</span>
+            </div>
+            <div style={{ fontSize: 13, color: C.secondary, lineHeight: 1.6, marginBottom: 14 }}>
+              How has it been going? Your answer shapes today's coaching.
+            </div>
+            <div style={{ display: "flex", gap: 8 }}>
+              <button
+                onClick={() => recordCheckin("improving")}
+                style={checkinBtn(C.lightGreen, C.accentGreen)}
+              >
+                Yes — feeling better
+              </button>
+              <button
+                onClick={() => recordCheckin("struggling")}
+                style={checkinBtn("#FEF3E2", C.warning)}
+              >
+                Yes — still struggling
+              </button>
+              <button
+                onClick={() => recordCheckin("not_yet")}
+                style={checkinBtn(C.card, C.secondary)}
+              >
+                Not yet
+              </button>
+            </div>
+          </div>
+        )}
 
         {feelProfile && (
           <div style={{
@@ -747,7 +772,7 @@ export default function AnalyzePage({
   const selectedFrames: SelectedFrame[] = [...coachingPoints]
     .sort((a, b) => a.timestamp - b.timestamp)
     .map((cp) => {
-      const img = frameImages[cp.frameIndex];
+      const img = resolveFrame(frameImages, cp.frameIndex, cp.timestamp);
       const short = cp.positionLabel.split(" ")[0] || cp.positionLabel;
       return {
         base64:     img?.base64 ?? "",
@@ -797,6 +822,7 @@ export default function AnalyzePage({
             <SectionLabel>Your swing</SectionLabel>
             <Card style={{ padding: 12 }}>
               <VideoPlayer
+                ref={playerRef}
                 videoUrl={videoUrl}
                 duration={result.videoDuration ?? 3}
                 frameTimestamps={result.frameTimestamps ?? []}
@@ -865,6 +891,7 @@ export default function AnalyzePage({
                   cardRef={(el) => {
                     if (el) cardRefs.current.set(globalIdx, el);
                   }}
+                  onSeek={seekVideo}
                 />
               );
             })}

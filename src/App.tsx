@@ -1,11 +1,13 @@
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import { C, F } from "./design";
 import RoundPage from "./pages/RoundPage";
 import AnalyzePage from "./pages/AnalyzePage";
 import SessionsPage from "./pages/SessionsPage";
 import DrillsPage from "./pages/DrillsPage";
+import AnalyticsPage from "./pages/AnalyticsPage";
+import type { Round } from "./lib/analytics";
 
-type Tab = "round" | "analyze" | "sessions" | "drills";
+type Tab = "round" | "analyze" | "sessions" | "drills" | "analytics";
 
 export interface FeelProfile {
   shotShape: string;
@@ -20,19 +22,6 @@ export interface FrameImage {
   timestamp: number;
   code: string;
   position: string;
-}
-
-/** Annotation data returned by Claude — rendered as SVG overlay on the frame. */
-export interface AnnotationData {
-  type: "line" | "circle" | "arc" | "arrow" | "path";
-  description: string;
-  bodyPart: string;
-  color: "green" | "amber" | "white";
-  geometry: {
-    startDescription: string;
-    endDescription: string;
-    shape: string;
-  };
 }
 
 /** One coaching point — either a strength, a focused fix, or an extra observation. */
@@ -51,7 +40,6 @@ export interface CoachingPoint {
   feelingCueCredit?: string;
   practiceDrill?: { name: string; description: string; reps: string };
   youtubeSearch?: { query: string; channel: string };
-  annotation?: AnnotationData;
 }
 
 /** A coaching-point frame enriched for the VideoPlayer thumbnail strip. */
@@ -108,6 +96,14 @@ export interface SessionMemory {
   analysis?: AnalysisResult;
 }
 
+/** A check-in response captured before a new analysis — used to adapt the
+ * coaching advice progression (de-prioritize fixed items, escalate struggles). */
+export interface CheckinResponse {
+  date: string;
+  focus: string;
+  response: "improving" | "struggling" | "not_yet";
+}
+
 function useFeelProfile() {
   const [profile, setProfile] = useState<FeelProfile | null>(() => {
     try { return JSON.parse(localStorage.getItem("ciq_feel_profile") || "null"); } catch { return null; }
@@ -131,16 +127,63 @@ function useSessionHistory() {
   return { history, add };
 }
 
+function useRoundHistory() {
+  const [rounds, setRounds] = useState<Round[]>(() => {
+    try { return JSON.parse(localStorage.getItem("ciq_rounds") || "[]"); } catch { return []; }
+  });
+  // Round writes happen inside RoundPage (not through this hook), so we
+  // refresh from storage on window focus and cross-tab storage events.
+  useEffect(() => {
+    const reload = () => {
+      try { setRounds(JSON.parse(localStorage.getItem("ciq_rounds") || "[]")); } catch {}
+    };
+    window.addEventListener("focus", reload);
+    window.addEventListener("storage", reload);
+    return () => {
+      window.removeEventListener("focus", reload);
+      window.removeEventListener("storage", reload);
+    };
+  }, []);
+  const reload = () => {
+    try { setRounds(JSON.parse(localStorage.getItem("ciq_rounds") || "[]")); } catch {}
+  };
+  return { rounds, reload };
+}
+
+function useCheckinResponses() {
+  const [responses, setResponses] = useState<CheckinResponse[]>(() => {
+    try { return JSON.parse(localStorage.getItem("ciq_checkin_responses") || "[]"); } catch { return []; }
+  });
+  const add = (entry: CheckinResponse) => {
+    const updated = [entry, ...responses].slice(0, 60);
+    setResponses(updated);
+    try { localStorage.setItem("ciq_checkin_responses", JSON.stringify(updated)); } catch {}
+  };
+  /** Remove all "improving" responses for a given focus — used by the
+   * "Still relevant?" restore action in the Sessions archived list. */
+  const restoreFocus = (focus: string) => {
+    const updated = responses.filter(
+      (r) => !(r.focus === focus && r.response === "improving"),
+    );
+    setResponses(updated);
+    try { localStorage.setItem("ciq_checkin_responses", JSON.stringify(updated)); } catch {}
+  };
+  return { responses, add, restoreFocus };
+}
+
 export default function App() {
   const [tab, setTab] = useState<Tab>("round");
   const { profile, save: saveProfile } = useFeelProfile();
   const { history, add: addSession } = useSessionHistory();
+  const { responses: checkinResponses, add: addCheckin, restoreFocus: restoreCheckinFocus } = useCheckinResponses();
+  const { rounds, reload: reloadRounds } = useRoundHistory();
 
   const TABS: { id: Tab; label: string }[] = [
-    { id: "round",    label: "Round" },
-    { id: "analyze",  label: "Analyze" },
-    { id: "sessions", label: "Sessions" },
-    { id: "drills",   label: "Drills" },
+    { id: "round",     label: "Round" },
+    { id: "analyze",   label: "Analyze" },
+    { id: "sessions",  label: "Sessions" },
+    { id: "analytics", label: "Analytics" },
+    { id: "drills",    label: "Drills" },
   ];
 
   return (
@@ -170,10 +213,11 @@ export default function App() {
       </div>
 
       <div style={{ paddingBottom: 64 }}>
-        {tab === "round"    && <RoundPage onFeelSaved={saveProfile} />}
-        {tab === "analyze"  && <AnalyzePage feelProfile={profile} sessionHistory={history} onSessionSaved={addSession} onSwitchTab={setTab} />}
-        {tab === "sessions" && <SessionsPage history={history} onSwitchTab={setTab} />}
-        {tab === "drills"   && <DrillsPage />}
+        {tab === "round"     && <RoundPage onFeelSaved={saveProfile} onRoundSaved={reloadRounds} />}
+        {tab === "analyze"   && <AnalyzePage feelProfile={profile} sessionHistory={history} checkinResponses={checkinResponses} roundHistory={rounds} onCheckinSaved={addCheckin} onSessionSaved={addSession} onSwitchTab={setTab} />}
+        {tab === "sessions"  && <SessionsPage history={history} checkinResponses={checkinResponses} onRestoreFocus={restoreCheckinFocus} onSwitchTab={setTab} />}
+        {tab === "analytics" && <AnalyticsPage rounds={rounds} onSwitchTab={setTab} />}
+        {tab === "drills"    && <DrillsPage />}
       </div>
 
       <div style={{ position: "fixed", bottom: 0, left: 0, right: 0, height: 52,

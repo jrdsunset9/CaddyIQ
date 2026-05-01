@@ -47,7 +47,12 @@ const CONTACTS = [
   { id: "Off the toe",     sub: "Contact toward the outer edge" },
 ];
 
-interface Props { onFeelSaved: (profile: FeelProfile) => void; }
+interface Props {
+  onFeelSaved: (profile: FeelProfile) => void;
+  /** Notifies App after a round is persisted to `ciq_rounds` so the
+   * in-memory round history (useRoundHistory) refreshes immediately. */
+  onRoundSaved?: () => void;
+}
 
 function Stepper({ value, onDec, onInc }: { value: number; onDec: () => void; onInc: () => void }) {
   const btn: React.CSSProperties = {
@@ -98,7 +103,7 @@ function useDebounce<T>(value: T, delay: number): T {
   return dv;
 }
 
-export default function RoundPage({ onFeelSaved }: Props) {
+export default function RoundPage({ onFeelSaved, onRoundSaved }: Props) {
   const [screen, setScreen] = useState<"select" | "round" | "feel" | "confirm">("select");
 
   // Course search
@@ -176,14 +181,18 @@ export default function RoundPage({ onFeelSaved }: Props) {
   const loadHoleData = useCallback((holeNum: number) => {
     const existing = holes.find(h => h.hole === holeNum);
     if (existing) {
+      // Restore exactly what the golfer entered — do not reset to par.
       setStrokes(existing.strokes);
       setPutts(existing.putts);
       setFairway(existing.fairwayHit === true ? "Fairway" : existing.fairwayHit === false ? "Missed" : null);
       setGir(existing.gir === true ? "GIR" : existing.gir === false ? "Missed" : null);
     } else {
-      setStrokes(4); setPutts(2); setFairway(null); setGir(null);
+      // Unplayed hole — default strokes to the hole's par so the stepper
+      // starts at a sane value for par 3s and par 5s alike.
+      setStrokes(getHolePar(holeNum));
+      setPutts(2); setFairway(null); setGir(null);
     }
-  }, [holes]);
+  }, [holes, getHolePar]);
 
   const navigateToHole = (holeNum: number) => {
     const isDone = holes.some(h => h.hole === holeNum);
@@ -204,7 +213,12 @@ export default function RoundPage({ onFeelSaved }: Props) {
     const par = getHolePar(holeNum);
     const newHole: HoleData = {
       hole: holeNum, par, strokes, putts,
-      fairwayHit: fairway === "Fairway" ? true : fairway === "Missed" ? false : null,
+      // Par 3s don't have a fairway concept — force null so analytics
+      // don't count them in FIR percentages (and so stale state from a
+      // previous par 4 can't leak through the hidden toggle).
+      fairwayHit: par === 3
+        ? null
+        : fairway === "Fairway" ? true : fairway === "Missed" ? false : null,
       gir: gir === "GIR" ? true : gir === "Missed" ? false : null,
     };
     const updated = [...holes.filter(h => h.hole !== holeNum), newHole].sort((a, b) => a.hole - b.hole);
@@ -228,7 +242,9 @@ export default function RoundPage({ onFeelSaved }: Props) {
           setFairway(nextExisting.fairwayHit === true ? "Fairway" : nextExisting.fairwayHit === false ? "Missed" : null);
           setGir(nextExisting.gir === true ? "GIR" : nextExisting.gir === false ? "Missed" : null);
         } else {
-          setStrokes(4); setPutts(2); setFairway(null); setGir(null);
+          // Default strokes to the next hole's par.
+          setStrokes(getHolePar(next));
+          setPutts(2); setFairway(null); setGir(null);
         }
       }
     }
@@ -242,6 +258,40 @@ export default function RoundPage({ onFeelSaved }: Props) {
       shotShape: shotShape ?? "", contact: contact ?? "", customFeels,
       lastUpdated: now, history: [entry, ...(existing.history ?? [])].slice(0, 10),
     };
+
+    // Persist the round to localStorage `ciq_rounds` for Analytics.
+    // Strictly additive — does not alter existing feel-save behavior.
+    if (selected && holes.length > 0) {
+      try {
+        const holeDistances = Array.from({ length: 18 }, (_, i) => {
+          const info = selected.holes?.[i];
+          if (!info) return 0;
+          const d = info.distances?.[teeBox];
+          return d && d > 0 ? d : 0;
+        });
+        // Use sum of played-hole pars so `scoreToPar` stays internally
+        // consistent. For 18-hole rounds this equals the course total;
+        // for partial rounds it stays accurate.
+        const playedPar = holes.reduce((s, h) => s + h.par, 0);
+        const round = {
+          id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+          date: now,
+          courseName: selected.name,
+          courseId: selected.id,
+          teeBox,
+          coursePar: playedPar > 0 ? playedPar : totalPar,
+          totalStrokes,
+          scoreToPar,
+          holes,
+          holeDistances,
+        };
+        const prior = JSON.parse(localStorage.getItem("ciq_rounds") || "[]");
+        const updated = [round, ...(Array.isArray(prior) ? prior : [])].slice(0, 100);
+        localStorage.setItem("ciq_rounds", JSON.stringify(updated));
+        onRoundSaved?.();
+      } catch {}
+    }
+
     onFeelSaved(profile);
     setScreen("confirm");
   };
@@ -324,7 +374,9 @@ export default function RoundPage({ onFeelSaved }: Props) {
         <button style={{ ...primaryBtn, opacity: selected ? 1 : 0.45, marginBottom: 12 }}
           disabled={!selected} onClick={() => {
             setCurrentHole(1); setHoles([]);
-            setStrokes(4); setPutts(2); setFairway(null); setGir(null);
+            // Default strokes to hole 1's par (falls back to 4 for manual courses).
+            const firstPar = selected?.holes?.[0]?.par ?? 4;
+            setStrokes(firstPar); setPutts(2); setFairway(null); setGir(null);
             setScreen("round");
           }}>
           {selected ? `Start round at ${selected.name.split(" ").slice(0, 3).join(" ")}` : "Select a course above"}
@@ -332,6 +384,7 @@ export default function RoundPage({ onFeelSaved }: Props) {
         <button style={secondaryBtn} onClick={() => {
           setSelected({ id: "manual", name: "My Course", city: "", state: "", par: 72, holes: [] });
           setCurrentHole(1); setHoles([]);
+          // Manual courses have no hole data → default stroke stepper to 4 (par).
           setStrokes(4); setPutts(2); setFairway(null); setGir(null);
           setScreen("round");
         }}>
@@ -499,11 +552,20 @@ export default function RoundPage({ onFeelSaved }: Props) {
                 </div>
               </div>
 
-              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 16, marginBottom: 20 }}>
-                <div>
-                  <div style={{ fontSize: 12, color: C.muted, marginBottom: 8, textTransform: "uppercase", letterSpacing: "0.06em" }}>Fairway</div>
-                  <Toggle options={["Fairway", "Missed"]} value={fairway} onChange={setFairway} />
-                </div>
+              {/* On par 3 holes, fairway hit is not a meaningful stat —
+                  the row is omitted entirely rather than shown blank.
+                  GIR always renders. */}
+              <div style={{
+                display: "grid",
+                gridTemplateColumns: hPar === 3 ? "1fr" : "1fr 1fr",
+                gap: 16, marginBottom: 20,
+              }}>
+                {hPar !== 3 && (
+                  <div>
+                    <div style={{ fontSize: 12, color: C.muted, marginBottom: 8, textTransform: "uppercase", letterSpacing: "0.06em" }}>Fairway</div>
+                    <Toggle options={["Fairway", "Missed"]} value={fairway} onChange={setFairway} />
+                  </div>
+                )}
                 <div>
                   <div style={{ fontSize: 12, color: C.muted, marginBottom: 8, textTransform: "uppercase", letterSpacing: "0.06em" }}>Green</div>
                   <Toggle options={["GIR", "Missed"]} value={gir} onChange={setGir} />

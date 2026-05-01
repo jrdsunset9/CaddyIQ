@@ -1,10 +1,71 @@
 import { useState } from "react";
 import { C, F, STATUS } from "../design";
-import type { SessionMemory, AnalysisResult, FrameImage } from "../App";
+import type { SessionMemory, AnalysisResult, FrameImage, CheckinResponse } from "../App";
 
 interface Props {
   history: SessionMemory[];
+  checkinResponses: CheckinResponse[];
+  onRestoreFocus: (focus: string) => void;
   onSwitchTab: (t: "round" | "analyze" | "sessions" | "drills") => void;
+}
+
+// ─── Progression helpers (CHANGE 4C) ─────────────────────────────────────────
+
+/** Count how many prior sessions contained a fix with a matching title.
+ *  Uses token-set overlap rather than substring includes so short common
+ *  words like "grip" or "takeaway" don't match every title containing them.
+ *  Two titles are considered the same fix when they share ≥60% of their
+ *  meaningful (3+ char) word tokens. */
+function countRecurringFixSessions(history: SessionMemory[], fixTitle: string): number {
+  const tokenize = (s: string): Set<string> => {
+    const words = s.trim().toLowerCase().replace(/[^\w\s]/g, " ").split(/\s+/);
+    return new Set(words.filter((w) => w.length >= 3));
+  };
+  const target = tokenize(fixTitle);
+  if (target.size === 0) return 0;
+
+  const matches = (other: Set<string>): boolean => {
+    if (other.size === 0) return false;
+    let shared = 0;
+    for (const t of target) if (other.has(t)) shared += 1;
+    const smaller = Math.min(target.size, other.size);
+    return shared / smaller >= 0.6;
+  };
+
+  let count = 0;
+  for (const s of history) {
+    const otherTitles = (s.analysis?.fixes ?? []).map((f) => tokenize(f.title || ""));
+    if (otherTitles.some(matches)) count += 1;
+  }
+  return count;
+}
+
+/** Determine which weekly-focus items the golfer has reported improving on 2+
+ * times — these are the "archived" fixes shown in the Sessions tab. Uses a
+ * normalized key (lowercase, trimmed, punctuation stripped) for dedup so that
+ * Claude-generated focus strings that drift in phrasing from session to
+ * session still collapse into a single archived entry. Preserves the most
+ * recent human-readable version of the focus for display. */
+function computeArchivedFoci(checkins: CheckinResponse[]): Array<{ focus: string; archivedDate: string }> {
+  const normKey = (s: string) => s.trim().toLowerCase().replace(/[^\w\s]/g, "").replace(/\s+/g, " ");
+  const byKey = new Map<string, { displayFocus: string; count: number; latest: string }>();
+  // checkins are prepended newest-first, so the FIRST time we see a key is the latest entry.
+  for (const r of checkins) {
+    if (r.response !== "improving" || !r.focus) continue;
+    const key = normKey(r.focus);
+    if (!key) continue;
+    const cur = byKey.get(key);
+    if (cur) {
+      cur.count += 1;
+    } else {
+      byKey.set(key, { displayFocus: r.focus, count: 1, latest: r.date });
+    }
+  }
+  const out: Array<{ focus: string; archivedDate: string }> = [];
+  for (const v of byKey.values()) {
+    if (v.count >= 2) out.push({ focus: v.displayFocus, archivedDate: v.latest });
+  }
+  return out;
 }
 
 function Label({ text }: { text: string }) {
@@ -59,21 +120,61 @@ function FrameStrip({ frames }: { frames: FrameImage[] }) {
   );
 }
 
-function FixCard({ fix, frameImages }: { fix: AnalysisResult["fixes"][0]; frameImages: FrameImage[] }) {
+function FixCard({
+  fix,
+  frameImages,
+  recurringSessions = 0,
+  showEscalation = false,
+}: {
+  fix: AnalysisResult["fixes"][0];
+  frameImages: FrameImage[];
+  recurringSessions?: number;
+  showEscalation?: boolean;
+}) {
   const ytQuery = fix.youtubeSearch?.query ? encodeURIComponent(fix.youtubeSearch.query) : null;
   const priority = fix.priority ?? 1;
   const accent = priority === 1 ? C.warning : priority === 2 ? C.accentGreen : C.secondary;
   const labels = ["Priority fix", "Secondary fix", "Bonus tip"];
-  const frameIdx = fix.frameIndex ?? null;
-  const frame = frameIdx !== null && frameImages[frameIdx] ? frameImages[frameIdx] : null;
+  // Closest-frame fallback: if the exact frameIndex isn't present, pick the
+  // frame with the nearest timestamp so coaching points always render against
+  // a real image rather than a blank placeholder.
+  const resolveFrame = (): FrameImage | null => {
+    if (!frameImages.length) return null;
+    const idx = fix.frameIndex;
+    if (typeof idx === "number" && idx >= 0 && idx < frameImages.length) {
+      return frameImages[idx];
+    }
+    if (typeof fix.timestamp === "number") {
+      let best = frameImages[0];
+      let bestDelta = Math.abs((best.timestamp ?? 0) - fix.timestamp);
+      for (const f of frameImages) {
+        const delta = Math.abs((f.timestamp ?? 0) - fix.timestamp);
+        if (delta < bestDelta) { best = f; bestDelta = delta; }
+      }
+      return best;
+    }
+    return frameImages[0] ?? null;
+  };
+  const frame = resolveFrame();
 
   return (
     <div style={{ border: "1px solid #E8E4DC", borderTop: `3px solid ${accent}`,
       borderRadius: 12, padding: 16, marginBottom: 10, background: "#fff" }}>
-      <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 8 }}>
-        <div style={{ fontSize: 11, fontWeight: 700, color: accent, textTransform: "uppercase",
-          letterSpacing: "0.08em" }}>
-          {labels[priority - 1] ?? labels[2]}
+      <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 8, gap: 8, flexWrap: "wrap" as const }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" as const }}>
+          <div style={{ fontSize: 11, fontWeight: 700, color: accent, textTransform: "uppercase",
+            letterSpacing: "0.08em" }}>
+            {labels[priority - 1] ?? labels[2]}
+          </div>
+          {recurringSessions >= 2 && (
+            <span style={{
+              fontSize: 10, fontWeight: 700, color: C.warning, background: "#FEF3E2",
+              border: `1px solid #F5C98A`, padding: "2px 8px", borderRadius: 100,
+              textTransform: "uppercase", letterSpacing: "0.06em",
+            }}>
+              Ongoing — session {recurringSessions}
+            </span>
+          )}
         </div>
         <div style={{ fontSize: 11, color: C.muted }}>
           {fix.position || fix.positionCode}{fix.timestamp != null ? ` · ${fix.timestamp.toFixed(1)}s` : ""}
@@ -148,14 +249,39 @@ function FixCard({ fix, frameImages }: { fix: AnalysisResult["fixes"][0]; frameI
           </div>
         </a>
       )}
+
+      {showEscalation && (
+        <div style={{
+          marginTop: 12, padding: "12px 14px", borderRadius: 8,
+          background: "#FEF3E2", border: `1px solid #F5C98A`,
+        }}>
+          <div style={{ fontSize: 12, fontWeight: 700, color: C.warning, marginBottom: 4,
+            textTransform: "uppercase", letterSpacing: "0.08em" }}>
+            Consider in-person help
+          </div>
+          <div style={{ fontSize: 13, color: C.secondary, lineHeight: 1.6 }}>
+            This fix has come up across 6+ sessions without clear improvement. Consider booking a lesson with a local PGA professional — sometimes an in-person eye catches what video can't.
+          </div>
+        </div>
+      )}
     </div>
   );
 }
 
-function SessionDetail({ session, onBack, onAnalyze }: {
+function SessionDetail({
+  session,
+  priorHistory,
+  archivedFoci,
+  onBack,
+  onAnalyze,
+  onRestoreFocus,
+}: {
   session: SessionMemory;
+  priorHistory: SessionMemory[];
+  archivedFoci: Array<{ focus: string; archivedDate: string }>;
   onBack: () => void;
   onAnalyze: () => void;
+  onRestoreFocus: (focus: string) => void;
 }) {
   const a = session.analysis;
   if (!a) {
@@ -271,9 +397,62 @@ function SessionDetail({ session, onBack, onAnalyze }: {
         {a.fixes?.length > 0 && (
           <div style={{ marginBottom: 20 }}>
             <Label text="Coaching fixes" />
-            {a.fixes.slice(0, 3).map((fix, i) => (
-              <FixCard key={i} fix={fix} frameImages={frameImages} />
-            ))}
+            {a.fixes.slice(0, 3).map((fix, i) => {
+              // Count how many PRIOR sessions (older than the one currently
+              // being viewed) contained the same fix title, then include the
+              // current session. Badge shows at 2+ total appearances;
+              // escalation fires at 6+ total appearances ("6 sessions without
+              // improvement").
+              const priorCount       = countRecurringFixSessions(priorHistory, fix.title || "");
+              const totalAppearances = priorCount + 1;
+              return (
+                <FixCard
+                  key={i}
+                  fix={fix}
+                  frameImages={frameImages}
+                  recurringSessions={totalAppearances}
+                  showEscalation={totalAppearances >= 6}
+                />
+              );
+            })}
+          </div>
+        )}
+
+        {/* Archived fixes — items the golfer reported improving on ×2+ */}
+        {archivedFoci.length > 0 && (
+          <div style={{ marginBottom: 20 }}>
+            <Label text={`Archived fixes (${archivedFoci.length})`} />
+            <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+              {archivedFoci.map(({ focus, archivedDate }, i) => (
+                <div key={i} style={{
+                  border: "1px solid #E8E4DC", borderRadius: 10, padding: "12px 14px",
+                  background: "#FAFAF8", opacity: 0.85,
+                }}>
+                  <div style={{ display: "flex", justifyContent: "space-between",
+                    alignItems: "flex-start", gap: 12 }}>
+                    <div style={{ flex: 1, minWidth: 0 }}>
+                      <div style={{ fontSize: 10, fontWeight: 700, color: C.accentGreen,
+                        textTransform: "uppercase", letterSpacing: "0.08em", marginBottom: 4 }}>
+                        Progress made — archived {archivedDate}
+                      </div>
+                      <div style={{ fontSize: 14, color: C.secondary, lineHeight: 1.5 }}>
+                        {focus}
+                      </div>
+                    </div>
+                    <button
+                      onClick={() => onRestoreFocus(focus)}
+                      style={{
+                        flexShrink: 0, border: "none", background: "none",
+                        color: C.accentGreen, fontSize: 12, fontWeight: 600,
+                        textDecoration: "underline", cursor: "pointer", padding: 0,
+                      }}
+                    >
+                      Still relevant?
+                    </button>
+                  </div>
+                </div>
+              ))}
+            </div>
           </div>
         )}
 
@@ -310,15 +489,23 @@ function SessionDetail({ session, onBack, onAnalyze }: {
   );
 }
 
-export default function SessionsPage({ history, onSwitchTab }: Props) {
+export default function SessionsPage({ history, checkinResponses, onRestoreFocus, onSwitchTab }: Props) {
   const [selected, setSelected] = useState<SessionMemory | null>(null);
+  const archivedFoci = computeArchivedFoci(checkinResponses);
 
   if (selected) {
+    // Sessions older than the selected one — used for recurring-fix counting
+    // so a fix flagged in the current session doesn't count itself as "prior".
+    const selectedIdx  = history.findIndex((s) => s.id === selected.id);
+    const priorHistory = selectedIdx >= 0 ? history.slice(selectedIdx + 1) : [];
     return (
       <SessionDetail
         session={selected}
+        priorHistory={priorHistory}
+        archivedFoci={archivedFoci}
         onBack={() => setSelected(null)}
         onAnalyze={() => { setSelected(null); onSwitchTab("analyze"); }}
+        onRestoreFocus={onRestoreFocus}
       />
     );
   }

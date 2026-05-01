@@ -9,7 +9,10 @@ import ffmpeg from "fluent-ffmpeg";
 import sharp from "sharp";
 import Anthropic from "@anthropic-ai/sdk";
 
-function findFfmpeg(): string {
+/** Locate the ffmpeg binary. Returns null instead of throwing so a missing
+ * binary surfaces as a per-request 500 rather than crashing the whole API
+ * server at startup. */
+function findFfmpeg(): string | null {
   if (process.env.FFMPEG_PATH) return process.env.FFMPEG_PATH;
   try {
     const cmd = process.platform === "win32" ? "where ffmpeg" : "which ffmpeg";
@@ -25,16 +28,20 @@ function findFfmpeg(): string {
   for (const p of fallbacks) {
     if (fs.existsSync(p)) return p;
   }
-  throw new Error("FFmpeg not found. Set FFMPEG_PATH environment variable.");
+  return null;
 }
 
-const FFMPEG_PATH = path.normalize(findFfmpeg());
-ffmpeg.setFfmpegPath(FFMPEG_PATH);
-console.log("FFmpeg path resolved:", FFMPEG_PATH);
-console.log("FFmpeg binary:", FFMPEG_PATH);
-console.log("FFmpeg exists:", fs.existsSync(FFMPEG_PATH));
-if (!fs.existsSync(FFMPEG_PATH)) {
-  throw new Error(`FFmpeg binary not found at "${FFMPEG_PATH}". Set FFMPEG_PATH or install ffmpeg.`);
+const RESOLVED_FFMPEG = findFfmpeg();
+const FFMPEG_PATH: string | null = RESOLVED_FFMPEG ? path.normalize(RESOLVED_FFMPEG) : null;
+if (FFMPEG_PATH && fs.existsSync(FFMPEG_PATH)) {
+  ffmpeg.setFfmpegPath(FFMPEG_PATH);
+  console.log("FFmpeg path resolved:", FFMPEG_PATH);
+} else {
+  console.error(
+    "[analyze] FFmpeg NOT found at startup —",
+    "video uploads will fail per-request with a 500 until FFMPEG_PATH is set",
+    "or ffmpeg is installed on PATH. Set FFMPEG_PATH env var to override.",
+  );
 }
 
 const router: IRouter = Router();
@@ -47,19 +54,26 @@ if (!process.env.ANTHROPIC_API_KEY) {
 
 const upload = multer({
   dest: os.tmpdir(),
-  limits: { fileSize: 500 * 1024 * 1024 },
+  // 200 MB is comfortably above an iPhone 4K-60 swing clip (~50 MB) while
+  // making it harder to fill the tmp partition with a single bad upload.
+  // (Reduced from 500 MB.)
+  // fieldSize bump: the default 1 MB cap caused "field value too long" errors
+  // because sessionHistory carries prior AnalysisResult JSON which includes
+  // base64 frameImages. Frontend now strips those before posting, but we
+  // keep a 10 MB safety net so an unusual session can't silently fail.
+  limits: { fileSize: 200 * 1024 * 1024, files: 1, fields: 20, fieldSize: 10 * 1024 * 1024 },
   fileFilter: (_req, file, cb) => {
-    const allowed =
+    const allowedMime =
       /video\/(mp4|quicktime|x-m4v|avi|x-matroska|webm|3gpp)|image\/(jpeg|png|heic|heif|webp)/i;
-    if (
-      allowed.test(file.mimetype) ||
-      /\.(mp4|mov|m4v|avi|mkv|webm|3gp|jpg|jpeg|png|heic|heif)$/i.test(
-        file.originalname,
-      )
-    ) {
+    const allowedExt =
+      /\.(mp4|mov|m4v|avi|mkv|webm|3gp|jpg|jpeg|png|heic|heif)$/i;
+    // Require BOTH a plausible MIME and a plausible extension. Browser-supplied
+    // mimetypes can be spoofed, but combined with extension this rejects the
+    // obvious "rename .exe to .mov" case. ffprobe still validates real format.
+    if (allowedMime.test(file.mimetype) && allowedExt.test(file.originalname)) {
       cb(null, true);
     } else {
-      cb(new Error("Unsupported file type"));
+      cb(new Error("Unsupported file type — please upload a video (.mp4/.mov) or image (.jpg/.png/.heic)."));
     }
   },
 });
@@ -102,18 +116,11 @@ function listFrames(frameDir: string): string[] {
     });
 }
 
-/** Extract frames evenly across the video using the fps= filter (Fix #1).
- *  This replaces the old `select='eq(t\,X)+...'` approach that was producing
- *  exit code 4294967274 (EINVAL) on iPhone HEVC/H.265 MOV files. The fps filter
- *  is computed so that `count` frames span the full duration.
- *
- *  Pass 1 target: up to 30 frames. Per the fix spec, if duration is short we
- *  fall back to `fps=3 -vframes 30` literally; otherwise we spread `count`
- *  frames evenly with `fps=count/duration`.
- *
- *  On failure, retries once with `thumbnail=30 -vframes 10` (Fix #4) — ffmpeg's
- *  built-in thumbnail filter works on virtually any decodable format.
- */
+/** Extract `count` frames evenly across the video using the fps= filter.
+ *  The fps filter is computed as `count / duration` so frames span the whole
+ *  video uniformly. Used for Pass 1 (swing detection) where we want a broad
+ *  overview — typically 30 frames across the full clip so Claude can find
+ *  the actual swing inside the pre-shot routine. */
 async function extractEvenFrames(
   videoPath: string,
   count: number,
@@ -125,14 +132,18 @@ async function extractEvenFrames(
   const inputPath     = path.normalize(videoPath);
   const outputPattern = path.normalize(path.join(frameDir, "frame_%03d.jpg"));
 
-  // Verbatim verified config — do NOT add -vsync vfr, -ss on input, or select=eq(t\,…)
+  // fps rate = count / duration, clamped so we always get at least ~1 fps
+  // (ffmpeg rejects extremely small floats) and never over 30 fps.
+  const safeDuration = Math.max(duration, 1);
+  const fpsRate = Math.max(0.5, Math.min(30, count / safeDuration));
+
   await new Promise<void>((resolve, reject) => {
     ffmpeg(inputPath)
       .inputOptions([])
       .outputOptions([
-        "-vf", "fps=2.34,scale=800:-2",
+        "-vf", `fps=${fpsRate.toFixed(3)},scale=800:-2`,
         "-q:v", "8",
-        "-vframes", "6",
+        "-vframes", String(count),
         "-map", "0:v:0",
       ])
       .output(outputPattern)
@@ -152,13 +163,11 @@ async function extractEvenFrames(
   if (files.length === 0) {
     throw new Error(
       "Video format not supported — please try a different video file. " +
-      "FFmpeg extracted zero frames with both the primary and thumbnail filters.",
+      "FFmpeg extracted zero frames.",
     );
   }
 
-  // Derive synthetic timestamps evenly distributed across the duration —
-  // the fps filter produces frames at regular intervals, so this accurately
-  // reflects where each frame sits in the original video.
+  // Derive evenly-distributed timestamps across the duration.
   const timestamps = files.map((_, i) => {
     const span = Math.max(duration - 0.05, 0);
     return parseFloat(((i + 0.5) * (span / files.length)).toFixed(3));
@@ -266,7 +275,135 @@ interface FeelProfileData {
   lastUpdated?: string;
 }
 
+interface CheckinResponseData {
+  date:     string;
+  focus:    string;
+  response: "improving" | "struggling" | "not_yet";
+}
+
 type ContentBlock = Anthropic.Messages.ContentBlockParam;
+
+// ─── CALL 0 — Pre-shot detection (strict two-pass) ───────────────────────────
+//
+// Pass 1 sends a broad 30-frame sweep of the full video to Claude and asks it
+// to identify where the actual swing starts and ends (excluding pre-shot
+// waggles, practice swings, setup routines, etc.). We then use the returned
+// window to extract the 6 frames we actually analyze for coaching.
+
+interface SwingDetection {
+  swing_start_frame: number;
+  swing_end_frame:   number;
+  confidence:        "high" | "medium" | "low";
+  notes:             string;
+}
+
+async function detectSwingBounds(
+  anthropic: Anthropic,
+  frames: Array<{ base64: string; timestamp: number; index: number }>,
+  signal?: AbortSignal,
+): Promise<SwingDetection> {
+  const content: ContentBlock[] = [];
+
+  content.push({
+    type: "text",
+    text: `You are analyzing frames from a golf video. Your only job is to find the LAST complete golf swing in this video.
+
+IGNORE everything before the final swing:
+- Walking up to the ball
+- Practice swings or waggles that return to address
+- Looking at the target
+- Settling into address stance
+- Any motion that does not commit to a full backswing
+
+The real swing starts at the LAST frame where the club is stationary at address immediately before the committed takeaway begins. A committed takeaway means the body has begun rotating and the club will not return to address.
+
+The real swing ends at the frame showing a balanced finish position — weight on lead foot, club behind the head, chest facing target.
+
+Look at every frame carefully. If you see the golfer waggle or make a practice motion and then re-settle, ignore everything before that final re-settlement.
+
+Return ONLY this JSON with no other text:
+{
+  "swing_start_frame": <integer index 0 to N>,
+  "swing_end_frame": <integer index 0 to N>,
+  "confidence": "<'high' | 'medium' | 'low'>",
+  "notes": "<one sentence: what you saw and where the real swing begins>"
+}
+
+If confidence is low, still pick the most likely window and explain why in notes.`,
+  });
+
+  frames.forEach(({ base64, timestamp, index }) => {
+    content.push({ type: "text", text: `Frame ${index} (${timestamp.toFixed(3)}s):` });
+    content.push({
+      type: "image",
+      source: { type: "base64", media_type: "image/jpeg", data: base64 },
+    });
+  });
+
+  const res = await anthropic.messages.create(
+    {
+      model: "claude-sonnet-4-6",
+      max_tokens: 400,
+      messages: [{ role: "user", content }],
+    },
+    signal ? { signal } : undefined,
+  );
+
+  const raw = res.content.find((b) => b.type === "text")?.text ?? "";
+  const cleaned = raw.replace(/```json\n?|```\n?/g, "").trim();
+
+  const tryParse = (s: string): SwingDetection | null => {
+    try {
+      const j = JSON.parse(s) as Record<string, unknown>;
+      if (typeof j.swing_start_frame === "number" && typeof j.swing_end_frame === "number") {
+        // Parenthesize the OR — the previous expression returned the BOOLEAN
+        // `true` on the happy path because `||` binds looser than `?:`.
+        const conf: SwingDetection["confidence"] =
+          (j.confidence === "high" || j.confidence === "low")
+            ? j.confidence
+            : "medium";
+        return {
+          swing_start_frame: Math.round(j.swing_start_frame),
+          swing_end_frame:   Math.round(j.swing_end_frame),
+          confidence:        conf,
+          notes:             String(j.notes ?? ""),
+        };
+      }
+    } catch {}
+    return null;
+  };
+
+  const parsed = tryParse(cleaned) ?? (() => {
+    const m = cleaned.match(/\{[\s\S]*\}/);
+    return m ? tryParse(m[0]) : null;
+  })();
+
+  if (parsed) {
+    // Clamp to the sent frame range and enforce a minimum 2-frame span so the
+    // 6-frame extraction window in Pass 2 doesn't collapse to a single moment.
+    const maxIdx = frames.length - 1;
+    parsed.swing_start_frame = Math.max(0, Math.min(maxIdx, parsed.swing_start_frame));
+    parsed.swing_end_frame   = Math.max(parsed.swing_start_frame, Math.min(maxIdx, parsed.swing_end_frame));
+    if (parsed.swing_end_frame - parsed.swing_start_frame < 2) {
+      // Expand the window symmetrically (clamped to bounds) so we still
+      // capture meaningful motion even if Claude returned a tiny range.
+      const center = (parsed.swing_start_frame + parsed.swing_end_frame) / 2;
+      parsed.swing_start_frame = Math.max(0, Math.floor(center - 2));
+      parsed.swing_end_frame   = Math.min(maxIdx, Math.ceil(center + 2));
+    }
+    return parsed;
+  }
+
+  // Fallback: use middle 60% of the clip if detection fails.
+  const startIdx = Math.floor(frames.length * 0.2);
+  const endIdx   = Math.floor(frames.length * 0.8);
+  return {
+    swing_start_frame: startIdx,
+    swing_end_frame:   endIdx,
+    confidence:        "low",
+    notes:             "Detection failed — defaulted to middle 60% of clip.",
+  };
+}
 
 // ─── CALL 1 — Frame labeling (fast, small) ────────────────────────────────────
 //
@@ -285,12 +422,28 @@ interface LabeledFrame {
 async function labelFrames(
   anthropic: Anthropic,
   frames: Array<{ base64: string; timestamp: number; index: number }>,
+  signal?: AbortSignal,
 ): Promise<LabeledFrame[]> {
   const content: ContentBlock[] = [];
 
+  // Explicit frame manifest at the TOP of the prompt — this is the only set
+  // of valid frameIndex values. Prevents the model from inventing or
+  // interpolating timestamps that don't correspond to a real extracted frame.
+  const frameManifest = frames
+    .map((f, i) => `Frame ${i}: extracted at exactly ${f.timestamp.toFixed(2)}s in the original video`)
+    .join("\n");
+
   content.push({
     type: "text",
-    text: `Label each frame with its swing position P1-P10. Return only JSON: [{frameIndex, position, timestamp, status: strength|focus-area}]`,
+    text: `FRAME MANIFEST — these are the ONLY frames available. You must reference frameIndex values 0 through ${frames.length - 1} only.
+Never reference a frame index outside this range.
+Never estimate or interpolate timestamps.
+
+${frameManifest}
+
+For every coaching point you return, the frameIndex field must be the integer index from this manifest that best shows the fault or position you are describing. The user will see that exact frame image next to your advice. Choose the frame where the fault is most visible.
+
+Label each frame with its swing position P1-P10. Return only JSON: [{frameIndex, position, timestamp, status: strength|focus-area}]`,
   });
 
   frames.forEach(({ base64, timestamp, index }) => {
@@ -301,11 +454,14 @@ async function labelFrames(
     });
   });
 
-  const res = await anthropic.messages.create({
-    model: "claude-sonnet-4-6",
-    max_tokens: 300,
-    messages: [{ role: "user", content }],
-  });
+  const res = await anthropic.messages.create(
+    {
+      model: "claude-sonnet-4-6",
+      max_tokens: 300,
+      messages: [{ role: "user", content }],
+    },
+    signal ? { signal } : undefined,
+  );
 
   const raw = res.content.find((b) => b.type === "text")?.text ?? "";
 
@@ -359,6 +515,21 @@ router.post("/analyze", upload.single("swing"), async (req, res) => {
     ? { field: req.file.fieldname, name: req.file.originalname, mime: req.file.mimetype, size: req.file.size }
     : "(none)");
 
+  // Cancellation plumbing: if the client disconnects (browser tab closed,
+  // 180s frontend AbortController fires, mobile data drops), we abort the
+  // in-flight Claude SDK calls instead of paying for a discarded request.
+  // Each Anthropic call burns ~$0.05 — orphaned requests add up fast.
+  const requestAbort = new AbortController();
+  let clientDisconnected = false;
+  const onClientClose = () => {
+    if (!res.writableEnded) {
+      clientDisconnected = true;
+      console.warn("[analyze] Client disconnected — aborting in-flight Claude calls");
+      requestAbort.abort();
+    }
+  };
+  req.on("close", onClientClose);
+
   try {
     if (!req.file) {
       res.status(400).json({ error: "No file uploaded — expected a form field named 'swing'." });
@@ -370,7 +541,14 @@ router.post("/analyze", upload.single("swing"), async (req, res) => {
       return;
     }
 
-    const { swingType, notes, sessionHistory, feelProfile } =
+    if (!FFMPEG_PATH || !fs.existsSync(FFMPEG_PATH)) {
+      res.status(500).json({
+        error: "FFmpeg is not installed on the server. Install ffmpeg or set the FFMPEG_PATH environment variable, then restart the API.",
+      });
+      return;
+    }
+
+    const { swingType, notes, sessionHistory, feelProfile, checkinHistory, analyticsSummary } =
       req.body as Record<string, string>;
 
     let previousSessions: SessionMemory[] = [];
@@ -381,6 +559,11 @@ router.post("/analyze", upload.single("swing"), async (req, res) => {
     let playerFeelProfile: FeelProfileData | null = null;
     if (feelProfile) {
       try { playerFeelProfile = JSON.parse(feelProfile); } catch {}
+    }
+
+    let playerCheckinHistory: CheckinResponseData[] = [];
+    if (checkinHistory) {
+      try { playerCheckinHistory = JSON.parse(checkinHistory); } catch {}
     }
 
     // 150s Anthropic SDK timeout leaves ~30s buffer before the 180s client/server
@@ -408,48 +591,122 @@ router.post("/analyze", upload.single("swing"), async (req, res) => {
     if (isVideo) {
       videoDuration = await getVideoDuration(uploadedPath!);
 
-      // ── EXTRACT: 6 frames evenly across the video (800px wide, q:v 8) ──
-      const detectResult = await extractEvenFrames(uploadedPath!, 6, videoDuration);
-      detectFrameDir = detectResult.frameDir;
+      // Cost-saver: very short clips (< 4 s) are almost certainly the swing
+      // itself with little/no pre-shot routine — skip the detection pass and
+      // use the whole clip. Saves ~15 image-equivalents (~$0.04) per analysis.
+      const SKIP_DETECTION_BELOW_S = 4;
+      let startT: number;
+      let endT: number;
 
-      const allFrames = await Promise.all(
-        detectResult.files.map(async (f, i) => ({
+      if (videoDuration < SKIP_DETECTION_BELOW_S) {
+        startT = 0;
+        endT   = videoDuration;
+        console.log(`Swing detected: skipped (clip < ${SKIP_DETECTION_BELOW_S}s, using full duration)`);
+        console.log(`Frames: full clip 0..${videoDuration.toFixed(2)}s`);
+        console.log(`Confidence: n/a`);
+      } else {
+        // ── PASS 1 (detection): 15 frames evenly across the full video ──
+        // Reduced from 30 → 15: detection only needs to spot the takeaway and
+        // finish, which is robust at 15 samples. Halves Pass 0 image cost.
+        const DETECT_FRAME_COUNT = 15;
+        const detectResult = await extractEvenFrames(uploadedPath!, DETECT_FRAME_COUNT, videoDuration);
+        detectFrameDir = detectResult.frameDir;
+
+        const detectionFrames = await Promise.all(
+          detectResult.files.map(async (f, i) => ({
+            base64:    await fileToBase64(f),
+            timestamp: detectResult.timestamps[i] ?? 0,
+            index:     i,
+          })),
+        );
+
+        req.log.info({ count: detectionFrames.length }, "Pass 1: detection frames extracted");
+
+        // ── CALL 0: Claude finds the actual swing window, ignoring pre-shot ──
+        const detection = await detectSwingBounds(anthropic, detectionFrames, requestAbort.signal);
+
+        // Span validation: if the model returned a tiny window (often the
+        // result of mistaking part of the pre-shot for the whole swing),
+        // expand symmetrically around the midpoint so we still capture
+        // meaningful motion in Pass 2.
+        const totalFrames = detectionFrames.length;
+        const span = detection.swing_end_frame - detection.swing_start_frame;
+        if (span < 4) {
+          console.warn(
+            "Swing window too narrow:", span,
+            "frames. Expanding symmetrically.",
+          );
+          const mid = Math.round(
+            (detection.swing_start_frame + detection.swing_end_frame) / 2,
+          );
+          detection.swing_start_frame = Math.max(0, mid - 5);
+          detection.swing_end_frame   = Math.min(totalFrames - 1, mid + 5);
+        }
+
+        console.log(
+          "Swing window:", detection.swing_start_frame, "to", detection.swing_end_frame,
+          "| Confidence:", detection.confidence,
+          "| Notes:", detection.notes,
+        );
+
+        req.log.info(
+          {
+            startFrame: detection.swing_start_frame,
+            endFrame:   detection.swing_end_frame,
+            confidence: detection.confidence,
+            notes:      detection.notes,
+          },
+          "Call 0: swing window detected",
+        );
+
+        // Convert frame indices → timestamps on the original video.
+        startT = detectionFrames[detection.swing_start_frame]?.timestamp ?? 0;
+        endT   = detectionFrames[detection.swing_end_frame]?.timestamp   ?? videoDuration;
+      }
+      swingStart = startT;
+      swingEnd   = endT;
+
+      // ── PASS 2: extract 6 frames evenly inside the detected swing window ──
+      const span = Math.max(endT - startT, 0.3);
+      const swingTimestamps = Array.from({ length: 6 }, (_, i) =>
+        parseFloat((startT + (i + 0.5) * (span / 6)).toFixed(3)),
+      );
+
+      const swingResult = await extractAtTimestamps(uploadedPath!, swingTimestamps);
+      swingFrameDir = swingResult.frameDir;
+
+      const labelingFrames = await Promise.all(
+        swingResult.files.map(async (f, i) => ({
           base64:    await fileToBase64(f),
-          timestamp: detectResult.timestamps[i] ?? 0,
+          timestamp: swingResult.timestamps[i] ?? 0,
           index:     i,
         })),
       );
 
-      req.log.info({ count: allFrames.length }, "Extracted 6 frames for labeling");
+      req.log.info({ count: labelingFrames.length }, "Pass 2: swing-window frames extracted");
 
-      // ── CALL 1: Label each frame P1–P10, mark status ──
-      const labeled = await labelFrames(anthropic, allFrames);
+      // ── CALL 1: Label each swing-window frame P1–P10, mark status ──
+      const labeled = await labelFrames(anthropic, labelingFrames, requestAbort.signal);
       req.log.info({ labeled: labeled.length }, "Call 1: frames labeled");
 
-      // Focus-area frames are the problem spots — these are the only frames
-      // we send to the heavy coaching call. Cap at 3 to keep Call 2 small.
+      // Focus-area frames are the problem spots — cap at 3 to keep Call 2 small.
       const focusIndices = new Set(
         labeled.filter((l) => l.status === "focus-area").slice(0, 3).map((l) => l.frameIndex),
       );
 
-      // Fallback: if Call 1 didn't flag anything as focus-area, fall back to
-      // a spread of 3 frames across the 6 so Call 2 always has something to work on.
-      let selected = allFrames.filter((f) => focusIndices.has(f.index));
+      let selected = labelingFrames.filter((f) => focusIndices.has(f.index));
       if (selected.length === 0) {
-        selected = [allFrames[1], allFrames[3], allFrames[5]].filter(Boolean) as typeof allFrames;
+        selected = [labelingFrames[1], labelingFrames[3], labelingFrames[5]].filter(Boolean) as typeof labelingFrames;
       }
 
-      // Re-label selected frames with their P-position from Call 1 for downstream use.
-      const labelByIndex = new Map(labeled.map((l) => [l.frameIndex, l]));
+      // Use the real extraction timestamp from the labelingFrames entry —
+      // not the label's own timestamp field, which can be missing or wrong
+      // if Claude returned duplicate or reordered frameIndices in Pass 1.
       swingFrames = selected.map((f, i) => ({
         base64:    f.base64,
-        timestamp: labelByIndex.get(f.index)?.timestamp ?? f.timestamp,
+        timestamp: f.timestamp,
         index:     i, // reindex 0..(n-1) so prompt frameMap stays aligned with sent images
       }));
-
-      // Derive swing window from the first/last selected frame timestamps for UI.
-      swingStart = swingFrames[0]?.timestamp ?? 0;
-      swingEnd   = swingFrames[swingFrames.length - 1]?.timestamp ?? videoDuration;
 
       req.log.info(
         { frames: swingFrames.length, swingStart, swingEnd },
@@ -466,13 +723,24 @@ router.post("/analyze", upload.single("swing"), async (req, res) => {
 
     // ── PASS 3: Full Claude analysis ──────────────────────────────────────────
 
+    // Cap user free-text fields before they go into the prompt so a long
+    // textarea entry can't blow past Anthropic's per-block size limit and
+    // surface as an opaque "field too long" error.
+    const truncate = (s: string, max: number): string =>
+      s.length <= max ? s : s.slice(0, max) + "…";
+    const safeNotes = truncate((notes || "").trim(), 500);
+    const safeCustomFeels = playerFeelProfile
+      ? truncate((playerFeelProfile.customFeels || "").trim(), 500)
+      : "";
+
     const feelProfileText = playerFeelProfile
-      ? `\n\nPLAYER FEEL PROFILE FROM RECENT ROUNDS:
-  Shot shape tendency: ${playerFeelProfile.shotShape || "not specified"}
-  Contact feel: ${playerFeelProfile.contact || "not specified"}
-  Self-reported swing feels: ${playerFeelProfile.customFeels || "none"}
+      ? `\n\nPlayer feel profile from recent rounds:
+  Shot shape tendency: ${truncate(playerFeelProfile.shotShape || "not specified", 120)}
+  Contact quality: ${truncate(playerFeelProfile.contact || "not specified", 120)}
+  Self-reported swing feels: ${safeCustomFeels || "none"}
   Last updated: ${playerFeelProfile.lastUpdated || "unknown"}
-Reference these naturally — e.g. "You mentioned feeling stuck on the downswing — looking at your frame I can see exactly why..." If these patterns are NOT visible in the video, celebrate that as improvement.`
+
+Reference these naturally in your analysis. If you can see the reported shot shape tendency in the video frames, confirm it. If you cannot see it, note that it may be a feel issue rather than a visible swing fault.`
       : "";
 
     const sessionHistoryText =
@@ -486,6 +754,63 @@ Reference these naturally — e.g. "You mentioned feeling stuck on the downswing
             .join("\n")}`
         : "\n\nThis is the golfer's FIRST session — no history yet.";
 
+    // ── Check-in progression (CHANGE 4B) ──
+    // Tally the golfer's self-reported state for each previous weekly focus so
+    // Claude can apply the 4-rule progression: de-prioritize items they report
+    // improving on, archive items they've improved on twice, reframe items
+    // they've struggled with 3+ times, and always introduce at least one new
+    // focus each session.
+    // Normalize focus strings (lowercase, strip punctuation, collapse spaces)
+    // so Claude's per-session phrasing drift doesn't fragment the tally.
+    // Keeps the most recent human-readable form for display in the prompt.
+    const normFocusKey = (s: string) =>
+      s.trim().toLowerCase().replace(/[^\w\s]/g, "").replace(/\s+/g, " ");
+    const checkinTally = new Map<
+      string,
+      { display: string; improving: number; struggling: number; not_yet: number }
+    >();
+    // Cap to the 30 most-recent check-ins. Older signals are stale anyway,
+    // and uncapped iteration was the largest unbounded prompt growth path.
+    const recentCheckins = playerCheckinHistory.slice(0, 30);
+    for (const r of recentCheckins) {
+      const f = (r.focus || "").trim();
+      if (!f) continue;
+      const key = normFocusKey(f);
+      if (!key) continue;
+      if (r.response !== "improving" && r.response !== "struggling" && r.response !== "not_yet") continue;
+      const cur = checkinTally.get(key) ?? { display: truncate(f, 120), improving: 0, struggling: 0, not_yet: 0 };
+      cur[r.response] += 1;
+      checkinTally.set(key, cur);
+    }
+
+    const checkinLines: string[] = [];
+    for (const t of checkinTally.values()) {
+      const parts: string[] = [];
+      if (t.improving)  parts.push(`improving ×${t.improving}`);
+      if (t.struggling) parts.push(`struggling ×${t.struggling}`);
+      if (t.not_yet)    parts.push(`not yet ×${t.not_yet}`);
+      checkinLines.push(`  - "${t.display}": ${parts.join(", ")}`);
+    }
+
+    // ── Analytics block ──
+    // Pre-formatted career SG + basic stats from the frontend. Injected
+    // verbatim so the prompt structure here stays clean.
+    const analyticsText = (analyticsSummary && analyticsSummary.trim().length > 0)
+      ? `\n\n${analyticsSummary.trim()}`
+      : "";
+
+    const checkinText =
+      checkinLines.length > 0
+        ? `\n\nPLAYER SELF-REPORTED PROGRESS (from before-analysis check-ins):
+${checkinLines.join("\n")}
+
+PROGRESSION RULES — apply these when choosing coaching points:
+1. Any focus the golfer has reported IMPROVING on ONCE → de-prioritize it. Mention briefly ("your takeaway feels better — great") but do NOT make it a priority fix again unless it clearly re-appears in the video.
+2. Any focus reported IMPROVING on TWO OR MORE times → treat it as ARCHIVED. Do not raise it as a fix this session. Celebrate the progress in the opening message only.
+3. Any focus reported STRUGGLING on THREE OR MORE times → REFRAME the approach. Do not repeat the same feeling cue or drill. Try a different angle — a different body part, a different feel, a different pro reference, a different drill. Acknowledge explicitly that the previous cue did not click.
+4. ALWAYS introduce at least ONE new focus area per session — never hand back only the same fixes the golfer has been working on.`
+        : "";
+
     // Hard safety cap — the 2-call flow already limits focus-area to 3, but
     // belt-and-suspenders in case someone changes that selection logic later.
     const MAX_FRAMES = 3;
@@ -496,8 +821,11 @@ Reference these naturally — e.g. "You mentioned feeling stuck on the downswing
     const totalKB = swingFrames.reduce((s, f) => s + f.base64.length * 0.75, 0) / 1024;
     console.log("Payload:", totalKB.toFixed(0), "KB across", swingFrames.length, "frames");
 
+    // Coaching-pass frame manifest. The user will see the exact frame at
+     // fix.frameIndex next to your advice — pick the one where the fault
+     // is most visible.
     const frameMap = swingFrames
-      .map((f) => `Frame ${f.index} (${f.timestamp.toFixed(3)}s)`)
+      .map((f) => `Frame ${f.index}: extracted at exactly ${f.timestamp.toFixed(2)}s in the original video`)
       .join("\n");
 
     const messageContent: ContentBlock[] = [];
@@ -512,11 +840,12 @@ SWING CONTEXT:
 - Shot type: ${swingType || "full swing"}
 - Full video duration: ${videoDuration.toFixed(2)}s
 - Actual swing detected: ${swingStart.toFixed(2)}s → ${swingEnd.toFixed(2)}s (pre-shot routine excluded)
-- Player notes: ${notes || "none"}
+- Player notes: ${safeNotes || "none"}
 - Frames available: ${swingFrames.length} (one every 0.1s across swing)
-${feelProfileText}${sessionHistoryText}
+${feelProfileText}${sessionHistoryText}${checkinText}${analyticsText}
 
-EXACT FRAME INDEX → TIMESTAMP MAP (use these exact values — do not invent timestamps):
+FRAME MANIFEST — these are the ONLY frames available. You must reference frameIndex values 0 through ${swingFrames.length - 1} only. Never reference a frame index outside this range. Never estimate or interpolate timestamps. The user will see the exact frame image at fix.frameIndex next to your advice — choose the frame where the fault is most visible.
+
 ${frameMap}
 
 ═══════════════════════════════════════════
@@ -525,13 +854,18 @@ ANALYSIS INSTRUCTIONS
 
 1. View ALL ${swingFrames.length} frames to understand the full swing motion before identifying positions.
 
-2. Identify between 8 and 14 coaching points total — DO NOT lock yourself to exactly 10. Choose the number that honestly represents what you see.
+2. Produce a focused coaching session of 4–7 coaching points total:
+   - 2 strengths (status: "strength") — what is genuinely working
+   - exactly 2 priority fixes (status: "focus-area") — the two most impactful changes only
+   - 0–3 extra observations (status: "extra-observation") — minor things worth flagging without full coaching treatment
+
+   Quality over quantity. The two priority fixes are the only items that need full coaching treatment (proRef, feelingCue, practiceDrill, youtubeSearch).
 
 3. For EACH coaching point, pick the SINGLE best frame that most clearly shows that position or fault. Use its EXACT frameIndex and timestamp from the map above.
 
-4. Also look for faults that occur BETWEEN standard positions (grip problems at address, early extension mid-backswing, casting in transition, etc.) — flag these as "extra-observation" points.
+4. Look for faults that occur BETWEEN standard positions (grip problems at address, early extension mid-backswing, casting in transition, etc.) — flag these as "extra-observation" points.
 
-5. A frameIndex must be the ACTUAL index of the frame you are analyzing. Never estimate or interpolate.
+5. EXACT FRAME MATCHING — NON-NEGOTIABLE: For every coaching point you make, you MUST reference the exact frameIndex from the map above. Do NOT interpolate, do NOT estimate, do NOT invent a frameIndex between two listed values. The frameIndex must be an integer from 0 to ${swingFrames.length - 1} that appears in the map. Same rule for timestamp — it must be the EXACT decimal listed in the map for that frameIndex.
 
 ═══════════════════════════════════════════
 PRIORITY ORDER — assign coachingPriority integers
@@ -562,16 +896,6 @@ COACHING PHILOSOPHY
 - Each fix must include a specific YouTube search query and recommended channel
 
 COPYRIGHT: All feeling cues must be original CaddyIQ language. Never reproduce a coach's known phrases verbatim.
-
-═══════════════════════════════════════════
-ANNOTATION INSTRUCTIONS
-═══════════════════════════════════════════
-
-For each coaching point, describe ONE annotation (max two shapes):
-- Use relative descriptive language: "from the lead shoulder to the trail hip", "circle around the lead elbow", "curved arrow from inside the swing plane to impact"
-- Use spatial positions: "upper left", "center frame", "lower right"
-- Colors: "green" for correct position/strength, "amber" for fault, "white" for neutral reference line
-- Keep annotations minimal and clear — one shape that highlights the key point
 
 ═══════════════════════════════════════════
 RETURN FORMAT — valid JSON only (start { end })
@@ -608,17 +932,6 @@ RETURN FORMAT — valid JSON only (start { end })
       "youtubeSearch": {
         "query": "<specific search query for this exact fault>",
         "channel": "<recommended channel — Me and My Golf | Rick Shiels | Danny Maude | Chris Ryan Golf | Rotary Swing | Performance Golf>"
-      },
-      "annotation": {
-        "type": "<line | circle | arc | arrow | path>",
-        "description": "<natural language of what this annotation highlights>",
-        "bodyPart": "<e.g. lead arm, club shaft, hip line, swing path>",
-        "color": "<green | amber | white>",
-        "geometry": {
-          "startDescription": "<e.g. 'from upper left where club head is' | 'at the lead shoulder'>",
-          "endDescription": "<e.g. 'to lower right at ball position' | 'to the trail hip'>",
-          "shape": "<e.g. 'straight line along shoulder plane' | 'circle around lead elbow' | 'curved arrow showing inside-out path'>"
-        }
       }
     }
   ],
@@ -631,12 +944,14 @@ RETURN FORMAT — valid JSON only (start { end })
 }
 
 CRITICAL RULES:
-• coachingPoints: 8–14 entries total
+• coachingPoints: 4–7 entries total — exactly 2 strengths, exactly 2 priority fixes, 0–3 extra observations
 • Every frameIndex must be a real index from the map (0–${swingFrames.length - 1})
 • Every timestamp must be the exact value from the map
 • Strengths: omit title, description, proRef, feelingCue, feelingCueCredit, practiceDrill, youtubeSearch
-• Fixes (focus-area + extra-observation): populate ALL fields including youtubeSearch
-• Do not include null values — just omit the field for strengths`,
+• Priority fixes (focus-area): populate ALL fields including youtubeSearch
+• Extra observations: title + description only — no proRef/feelingCue/practiceDrill/youtubeSearch
+• Do not include null values — just omit the field
+• Be concise: descriptions under 100 words, feelingCues under 50 words`,
     });
 
     swingFrames.forEach(({ base64, timestamp, index }) => {
@@ -652,19 +967,50 @@ CRITICAL RULES:
 
     messageContent.push({
       type: "text",
-      text: "Analyze all frames and return your complete coaching JSON. 8–14 coaching points, exact frameIndex and timestamp values, coachingPriority follows the fundamentals order, all feeling cues are original CaddyIQ voice with credit lines, every fix has youtubeSearch. Provide exactly 2 priority fixes — the two most impactful changes only. Quality over quantity. Be concise in all string values. Keep each description under 100 words. Keep feeling cues under 50 words. This keeps the JSON response within token limits.",
+      text: "Return your complete coaching JSON now. Exactly 2 strengths, exactly 2 priority fixes (focus-area, fully populated with proRef/feelingCue/practiceDrill/youtubeSearch), and 0–3 extra observations (title + description only). Use exact frameIndex and timestamp values from the map. Keep descriptions under 100 words and feelingCues under 50 words.",
     });
 
     req.log.info({ frames: swingFrames.length }, "Pass 3: sending to Claude");
 
+    const messageContent_size = JSON.stringify(messageContent).length;
+    console.log('Total payload size:', (messageContent_size / 1024).toFixed(1), 'KB');
+    messageContent.forEach((item, i) => {
+      if (item.type === 'text') {
+        console.log('Text block', i, ':', item.text.length, 'chars');
+      }
+      if (item.type === 'image' && item.source.type === 'base64') {
+        console.log('Image block', i, ':',
+          (item.source.data.length / 1024).toFixed(1), 'KB base64');
+      }
+    });
+
     let claudeRes: Anthropic.Messages.Message;
     try {
-      claudeRes = await anthropic.messages.create({
-        model: "claude-sonnet-4-6",
-        max_tokens: 4000,
-        messages: [{ role: "user", content: messageContent }],
-      });
+      claudeRes = await anthropic.messages.create(
+        {
+          model: "claude-sonnet-4-6",
+          // 8000 leaves headroom for 4–7 fully-populated coaching points plus
+          // headline/opening/closing/sessionSummary. Previous 4000 was the
+          // root cause of the "JSON truncated mid-stream" issue.
+          max_tokens: 8000,
+          messages: [{ role: "user", content: messageContent }],
+        },
+        { signal: requestAbort.signal },
+      );
+      // Surface the real stop reason so we can detect token-limit truncation
+      // ("max_tokens") vs. a clean finish ("end_turn").
+      console.log(
+        "[analyze] Pass 3 stop_reason:", claudeRes.stop_reason,
+        "input:", claudeRes.usage?.input_tokens,
+        "output:", claudeRes.usage?.output_tokens,
+      );
     } catch (apiErr: unknown) {
+      // Client-disconnect aborts come back as DOMException("AbortError") or
+      // similar. Don't log them as scary "API call failed" — bail quietly.
+      if (clientDisconnected || (apiErr instanceof Error && apiErr.name === "AbortError")) {
+        req.log.info("[analyze] Pass 3 aborted (client disconnect)");
+        return;
+      }
       const e = apiErr as {
         status?: number;
         message?: string;
@@ -739,27 +1085,63 @@ CRITICAL RULES:
       feelingCueCredit?: string;
       practiceDrill?: { name: string; description: string; reps: string };
       youtubeSearch?: { query: string; channel: string };
-      annotation?: unknown;
     };
 
     const coachingPoints = (parsed.coachingPoints as CP[] | undefined) ?? [];
+
+    // ── frameIndex validation ──
+    // Every coaching point's frameIndex MUST point at a real extracted frame,
+    // and its timestamp MUST come from that frame's actual extraction time
+    // (not a Claude-invented number). Without this, the frontend renders
+    // a coaching card whose image doesn't match the position being described.
+    const N = swingFrames.length;
+    for (const cp of coachingPoints) {
+      if (
+        cp.frameIndex === undefined ||
+        cp.frameIndex === null ||
+        !Number.isFinite(cp.frameIndex) ||
+        cp.frameIndex < 0 ||
+        cp.frameIndex >= N
+      ) {
+        console.warn(
+          "Invalid frameIndex on coaching point:",
+          cp.title || cp.positionLabel || "(untitled)",
+          "value:", cp.frameIndex,
+          "— defaulting to frame 0",
+        );
+        cp.frameIndex = 0;
+      }
+      // Stamp the real extraction timestamp so the frontend can seek the
+      // video to the exact moment the AI is referencing.
+      cp.timestamp = swingFrames[cp.frameIndex].timestamp;
+    }
+
     const fixes = coachingPoints
       .filter((p) => p.status !== "strength")
       .sort((a, b) => (a.coachingPriority ?? 99) - (b.coachingPriority ?? 99))
-      .map((p, i) => ({
-        priority:        i === 0 ? 1 : i === 1 ? 2 : 3,
-        title:           p.title || p.positionLabel || `Fix ${i + 1}`,
-        position:        p.positionLabel || "",
-        positionCode:    (p.positionLabel || "").split(" ")[0],
-        frameIndex:      p.frameIndex ?? 0,
-        timestamp:       p.timestamp ?? 0,
-        description:     p.description || p.observation || "",
-        proRef:          p.proRef,
-        feelingCue:      p.feelingCue,
-        feelingCueCredit:p.feelingCueCredit,
-        practiceDrill:   p.practiceDrill,
-        youtubeSearch:   p.youtubeSearch,
-      }));
+      .map((p, i) => {
+        // frameIndex was already validated above; safe to dereference.
+        const idx = p.frameIndex ?? 0;
+        const ts  = swingFrames[idx]?.timestamp ?? 0;
+        return {
+          // Preserve true ordering (1, 2, 3, 4...) — the previous ternary
+          // capped every fix beyond the second at priority 3, breaking
+          // SessionsPage display for analyses with 3+ fixes.
+          priority:        i + 1,
+          title:           p.title || p.positionLabel || `Fix ${i + 1}`,
+          position:        p.positionLabel || "",
+          positionCode:    (p.positionLabel || "").split(" ")[0],
+          frameIndex:      idx,
+          timestamp:       ts,
+          frameTimestamp:  ts, // explicit per spec — frontend reads this for seek
+          description:     p.description || p.observation || "",
+          proRef:          p.proRef,
+          feelingCue:      p.feelingCue,
+          feelingCueCredit:p.feelingCueCredit,
+          practiceDrill:   p.practiceDrill,
+          youtubeSearch:   p.youtubeSearch,
+        };
+      });
 
     parsed.fixes               = fixes;
     parsed.videoFramesAnalyzed = swingFrames.length;
@@ -769,10 +1151,14 @@ CRITICAL RULES:
     parsed.swingStart          = swingStart;
     parsed.swingEnd            = swingEnd;
 
-    // Return ALL extracted frames as base64 so frontend can look up any frame by index
+    // Return ALL extracted frames as base64 so frontend can look up any frame
+    // by index. `index` is the canonical 0..N-1 used by every coachingPoint
+    // and fix.frameIndex returned above — frontend should index this array
+    // directly rather than trusting any other ordering.
     parsed.frameImages = swingFrames.map((f) => ({
       base64:    f.base64,
       timestamp: f.timestamp,
+      index:     f.index,
       code:      `F${f.index}`,
       position:  `Frame ${f.index}`,
     }));
@@ -782,8 +1168,18 @@ CRITICAL RULES:
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : "Analysis failed";
     req.log.error({ err }, "Analysis error");
-    res.status(500).json({ error: message });
+    // If the socket was closed mid-response, res.json can throw — guard so
+    // the finally cleanup still runs and we don't escape to Express's default
+    // HTML error handler.
+    if (!res.headersSent) {
+      try { res.status(500).json({ error: message }); } catch {}
+    }
   } finally {
+    // Detach the close listener so we don't leak handlers across requests.
+    req.removeListener("close", onClientClose);
+    if (clientDisconnected) {
+      req.log.info("[analyze] Request was aborted by client; cleaning up tmp files");
+    }
     if (uploadedPath)    cleanup(uploadedPath);
     if (detectFrameDir)  cleanup(detectFrameDir);
     if (swingFrameDir)   cleanup(swingFrameDir);
