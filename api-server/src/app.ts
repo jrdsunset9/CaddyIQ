@@ -61,4 +61,21 @@ app.use("/api", (err: unknown, req: Request, res: Response, _next: NextFunction)
 
   // Only send if we haven't already started responding.
   if (!res.headersSent) {
-    res.status(status).json({ error
+    res.status(status).json({ error: message });
+  }
+});
+
+// Serve the built React frontend (Railway: process.cwd() is the project root)
+const frontendDist = path.join(process.cwd(), "dist");
+if (fs.existsSync(frontendDist)) {
+  app.use(express.static(frontendDist));
+  // SPA fallback — send index.html for any non-API route
+  app.get("*", (_req, res) => {
+    res.sendFile(path.join(frontendDist, "index.html"));
+  });
+  logger.info({ frontendDist }, "Serving frontend static files");
+} else {
+  logger.warn({ frontendDist }, "Frontend dist not found — run 'npm run build' first");
+}
+
+export default app;

@@ -9,3 +9,4 @@ api-server/dist/
 # Build artifacts / large bundles — never commit
 *.zip
 Caddy-Iq.zip
+caddyiq.zip

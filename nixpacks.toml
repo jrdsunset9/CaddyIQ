@@ -1,1 +1,11 @@
-[pha
+[phases.setup]
+nixPkgs = ["nodejs_20", "ffmpeg"]
+
+[phases.install]
+cmds = ["npm install", "cd api-server && npm install"]
+
+[phases.build]
+cmds = ["npm run build"]
+
+[start]
+cmd = "node --import tsx/esm api-server/src/index.ts"
