@@ -1,6 +1,8 @@
 import express, { type Express, type Request, type Response, type NextFunction } from "express";
 import cors from "cors";
 import pinoHttp from "pino-http";
+import path from "path";
+import fs from "fs";
 import router from "./routes";
 import { logger } from "./lib/logger";
 
@@ -59,8 +61,4 @@ app.use("/api", (err: unknown, req: Request, res: Response, _next: NextFunction)
 
   // Only send if we haven't already started responding.
   if (!res.headersSent) {
-    res.status(status).json({ error: message });
-  }
-});
-
-export default app;
+    res.status(status).json({ error
