@@ -20,10 +20,11 @@ function findFfmpeg(): string | null {
     if (result) return result;
   } catch {}
   const fallbacks = [
+    "/usr/bin/ffmpeg",
+    "/run/current-system/sw/bin/ffmpeg",
+    "/usr/local/bin/ffmpeg",
     "C:\\ffmpeg\\bin\\ffmpeg.exe",
     "C:\\ProgramData\\chocolatey\\bin\\ffmpeg.exe",
-    "/usr/local/bin/ffmpeg",
-    "/usr/bin/ffmpeg",
   ];
   for (const p of fallbacks) {
     if (fs.existsSync(p)) return p;
@@ -57,11 +58,11 @@ const upload = multer({
   // 200 MB is comfortably above an iPhone 4K-60 swing clip (~50 MB) while
   // making it harder to fill the tmp partition with a single bad upload.
   // (Reduced from 500 MB.)
-  // fieldSize bump: the default 1 MB cap caused "field value too long" errors
-  // because sessionHistory carries prior AnalysisResult JSON which includes
-  // base64 frameImages. Frontend now strips those before posting, but we
-  // keep a 10 MB safety net so an unusual session can't silently fail.
-  limits: { fileSize: 200 * 1024 * 1024, files: 1, fields: 20, fieldSize: 10 * 1024 * 1024 },
+  // fieldSize: 2 MB — frontend strips base64 frameImages from sessionHistory
+  // before posting, so real fields are <100 KB. 2 MB gives a ~20× safety
+  // margin without exposing the prior 200 MB worst-case combined payload
+  // (10 MB × 20 fields). Now ~24 MB worst-case combined.
+  limits: { fileSize: 200 * 1024 * 1024, files: 1, fields: 12, fieldSize: 2 * 1024 * 1024 },
   fileFilter: (_req, file, cb) => {
     const allowedMime =
       /video\/(mp4|quicktime|x-m4v|avi|x-matroska|webm|3gpp)|image\/(jpeg|png|heic|heif|webp)/i;
@@ -1087,7 +1088,13 @@ CRITICAL RULES:
       youtubeSearch?: { query: string; channel: string };
     };
 
-    const coachingPoints = (parsed.coachingPoints as CP[] | undefined) ?? [];
+    // Defensive: Claude's salvaged JSON has been observed to return
+    // `coachingPoints` as `null` or an object on truncation edges. The cast
+    // alone won't protect us — explicitly normalize to an array so the
+    // downstream `for…of` and `.filter` can never throw "not iterable."
+    const coachingPoints: CP[] = Array.isArray(parsed.coachingPoints)
+      ? (parsed.coachingPoints as CP[])
+      : [];
 
     // ── frameIndex validation ──
     // Every coaching point's frameIndex MUST point at a real extracted frame,
@@ -1095,25 +1102,33 @@ CRITICAL RULES:
     // (not a Claude-invented number). Without this, the frontend renders
     // a coaching card whose image doesn't match the position being described.
     const N = swingFrames.length;
-    for (const cp of coachingPoints) {
-      if (
-        cp.frameIndex === undefined ||
-        cp.frameIndex === null ||
-        !Number.isFinite(cp.frameIndex) ||
-        cp.frameIndex < 0 ||
-        cp.frameIndex >= N
-      ) {
-        console.warn(
-          "Invalid frameIndex on coaching point:",
-          cp.title || cp.positionLabel || "(untitled)",
-          "value:", cp.frameIndex,
-          "— defaulting to frame 0",
-        );
-        cp.frameIndex = 0;
+    if (N === 0) {
+      // No frames to attribute coaching points to — extremely defensive,
+      // would only happen if Pass 2 dropped every selected frame. Skip
+      // the bounds-check loop entirely so we don't deref undefined.
+      console.warn("[analyze] No swingFrames available for frameIndex stamping; skipping bounds check.");
+    } else {
+      for (const cp of coachingPoints) {
+        if (
+          cp.frameIndex === undefined ||
+          cp.frameIndex === null ||
+          !Number.isFinite(cp.frameIndex) ||
+          cp.frameIndex < 0 ||
+          cp.frameIndex >= N
+        ) {
+          console.warn(
+            "Invalid frameIndex on coaching point:",
+            cp.title || cp.positionLabel || "(untitled)",
+            "value:", cp.frameIndex,
+            "— defaulting to frame 0",
+          );
+          cp.frameIndex = 0;
+        }
+        // Stamp the real extraction timestamp so the frontend can seek the
+        // video to the exact moment the AI is referencing. Optional-chain
+        // belt-and-suspenders in case the bounds check ever drifts.
+        cp.timestamp = swingFrames[cp.frameIndex]?.timestamp ?? 0;
       }
-      // Stamp the real extraction timestamp so the frontend can seek the
-      // video to the exact moment the AI is referencing.
-      cp.timestamp = swingFrames[cp.frameIndex].timestamp;
     }
 
     const fixes = coachingPoints

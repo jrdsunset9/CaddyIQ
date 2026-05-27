@@ -27,7 +27,14 @@ app.use(
     },
   }),
 );
-app.use(cors());
+app.use(cors({
+  origin: [
+    'http://localhost:5173',
+    'http://localhost:3000',
+    process.env.FRONTEND_URL || '*',
+  ],
+  credentials: true,
+}));
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
@@ -69,8 +76,13 @@ app.use("/api", (err: unknown, req: Request, res: Response, _next: NextFunction)
 const frontendDist = path.join(process.cwd(), "dist");
 if (fs.existsSync(frontendDist)) {
   app.use(express.static(frontendDist));
-  // SPA fallback — send index.html for any non-API route
-  app.get("*", (_req, res) => {
+  // SPA fallback — send index.html for any non-API GET (and HEAD, which
+  // health checkers and link prefetchers use). Express 5's path-to-regexp
+  // v6 no longer accepts bare "*" as a route pattern, so we use a
+  // middleware with an explicit /api guard instead.
+  app.use((req, res, next) => {
+    if (req.method !== "GET" && req.method !== "HEAD") return next();
+    if (req.path.startsWith("/api")) return next();
     res.sendFile(path.join(frontendDist, "index.html"));
   });
   logger.info({ frontendDist }, "Serving frontend static files");

@@ -1,0 +1,11 @@
+run = "node --import tsx/esm src/index.ts"
+entrypoint = "src/index.ts"
+
+[nix]
+channel = "stable-24_05"
+
+[deployment]
+run = ["sh", "-c", "node --import tsx/esm src/index.ts"]
+
+[env]
+PORT = "3000"
