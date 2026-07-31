@@ -1,5 +1,90 @@
 # CaddyIQ — Agent Log
 
+## Replit deployment prep (2026-05-26)
+
+Got the backend ready to deploy to Replit. All file changes done and
+pushed to `origin/master` as commit `56d04f1`. User now needs to do
+the manual Replit UI steps (import repo, set Secrets, click Run).
+
+### Files changed
+
+- `api-server/.replit` — new. Run/entrypoint/deployment/env config so
+  Replit launches the server with `node --import tsx/esm src/index.ts`.
+  `[env] PORT = "3000"` matches Replit's expected public port.
+- `api-server/replit.nix` — new. Installs `nodejs_20`, `ffmpeg`, and
+  `nodePackages.typescript` from Nix `stable-24_05`. FFmpeg lands at
+  `/run/current-system/sw/bin/ffmpeg` (or `/usr/bin/ffmpeg`).
+- `api-server/src/routes/analyze.ts` — reordered `findFfmpeg()`
+  fallbacks so Linux/Nix paths are checked FIRST. New order:
+  `process.env.FFMPEG_PATH` → `which ffmpeg` → `/usr/bin/ffmpeg` →
+  `/run/current-system/sw/bin/ffmpeg` → `/usr/local/bin/ffmpeg` →
+  Windows WinGet paths last. Windows local dev still works because
+  `where ffmpeg` resolves first on Windows.
+- `api-server/src/app.ts` — CORS now passes an explicit `origin` allow-list
+  (`localhost:5173`, `localhost:3000`, `process.env.FRONTEND_URL` or `*`)
+  with `credentials: true` instead of the wide-open default `cors()`.
+- `api-server/package.json` — `start` script no longer passes
+  `--env-file=.env` (Replit injects env vars from its Secrets tab, and
+  there's no `.env` file in the deployment anyway). Added a no-op
+  `build` script so any platform that runs `npm run build` succeeds.
+
+### Step 4 deviation (mockup-sandbox config)
+
+The deploy prompt's Step 4 said to create `mockup-sandbox/src/config.ts`
+and replace hardcoded `localhost:3001`/`localhost:3000` fetches with an
+`API_BASE` constant. **Skipped intentionally**:
+
+- There is no `mockup-sandbox/` directory in this repo — the frontend
+  lives at `src/`.
+- All four `fetch()` calls in `src/` already use relative paths
+  (`/api/analyze`, `/api/courses?q=...`) — verified with grep.
+- The Express server in `api-server/src/app.ts` serves the built React
+  frontend (`dist/`) as static files, so frontend and API share the
+  same origin in production. Relative URLs Just Work.
+- During local dev, Vite proxies `/api` → `127.0.0.1:3001` per
+  `vite.config.ts`.
+
+If we ever split the frontend onto its own Replit/Vercel host, set
+`FRONTEND_URL` in the backend Secrets and the CORS allow-list will
+pick it up.
+
+### Typecheck status
+
+- `api-server`: `tsc --noEmit` clean.
+- Frontend: unchanged; the pre-existing `RoundPage.tsx:160` errors from
+  the prior pass remain (still untouched, still scope-flagged).
+
+### What user does next (Replit UI)
+
+1. replit.com → sign in with GitHub
+2. + Create Repl → Import from GitHub → `jrdsunset9/CaddyIQ`
+3. Root directory: `api-server`
+4. Secrets tab:
+   - `ANTHROPIC_API_KEY = sk-ant-...`
+   - `NODE_ENV = production`
+5. Run → copy public URL → visit `<url>/api/health` → expect
+   `{"status":"ok"}`
+
+### Possible follow-ups after first deploy
+
+- If frontend ends up on a separate host, set `FRONTEND_URL` Secret on
+  the backend Repl.
+- If the analyze route 500s with "FFmpeg not installed" on first run,
+  check the log line `FFmpeg path resolved: <path>` at startup — if
+  it's missing, the Nix channel may have moved ffmpeg; set
+  `FFMPEG_PATH` Secret to whatever `which ffmpeg` returns in the
+  Replit shell.
+- Watch for cold-start timeouts on the 180s `req.setTimeout` in
+  `analyze.ts:507` — Replit's free tier sleeps the container and the
+  first analysis after sleep may need a warm-up request.
+
+### Files NOT changed (scope guard)
+
+Per CLAUDE.md "Never Change These": swing analyzer algorithm, Club &
+Classic design, session memory, feel profile, drill library, course
+search, FFmpeg path-resolution **logic** (only the fallback order
+moved). All untouched.
+
 ## Pre-beta polish pass
 
 Three priorities ahead of beta. All implemented; ready for the user

@@ -860,7 +860,7 @@ ANALYSIS INSTRUCTIONS
    - exactly 2 priority fixes (status: "focus-area") — the two most impactful changes only
    - 0–3 extra observations (status: "extra-observation") — minor things worth flagging without full coaching treatment
 
-   Quality over quantity. The two priority fixes are the only items that need full coaching treatment (proRef, feelingCue, practiceDrill, youtubeSearch).
+   Quality over quantity. The two priority fixes are the only items that need full coaching treatment (proRef + feelingCue always; practiceDrill/youtubeSearch per the MEDIA JUDGMENT rule below).
 
 3. For EACH coaching point, pick the SINGLE best frame that most clearly shows that position or fault. Use its EXACT frameIndex and timestamp from the map above.
 
@@ -894,7 +894,16 @@ COACHING PHILOSOPHY
 - Generate ORIGINAL feeling cues in CaddyIQ's own voice — never quote a coach directly or reproduce known phrases
 - After each feeling cue, credit: "Concept inspired by [First Name Last Name]'s [specific teaching concept]"
 - Give ONE focused weekly drill — not a list
-- Each fix must include a specific YouTube search query and recommended channel
+
+VOICE — every "observation" and "description" string:
+- Write like you're talking to the golfer, not filing a report. Narrative sentences, not clinical bullet fragments.
+- Upbeat, concise, get to the point fast. No filler ("it's worth noting that", "one thing to consider is").
+- Say what you see, why it matters, and stop. 1-3 sentences max — shorter is better when the fix is simple.
+
+MEDIA JUDGMENT — for each priority fix (focus-area), decide case-by-case whether it needs attached media:
+- Simple, posture-level, one-cue fixes (grip pressure, ball position, stance width, alignment) → feelingCue only. OMIT practiceDrill and youtubeSearch entirely — a one-line feel adjustment doesn't need a video and drill turning a small tweak into homework.
+- Mechanically complex faults that need repetition to groove (swing plane, sequencing/transition, casting, early extension, path/face timing) → include practiceDrill and/or youtubeSearch, whichever actually helps. You don't need both every time.
+- Use your judgment on which fixes are "simple" vs "complex" — don't attach media reflexively to every fix.
 
 COPYRIGHT: All feeling cues must be original CaddyIQ language. Never reproduce a coach's known phrases verbatim.
 
@@ -938,21 +947,30 @@ RETURN FORMAT — valid JSON only (start { end })
   ],
   "weeklyFocus": "<ONE sentence. ONE thing only.>",
   "closingMessage": "<1-2 sentences of genuine encouragement>",
+  "feelingLayer": {
+    "narrative": "<1-3 sentences, OMIT this whole object if you have nothing genuine to say here>"
+  },
   "sessionSummary": {
     "faultsIdentified": ["<fault 1>", "<fault 2>"],
     "improvementsNoted": ["<improvement visible from previous session, or empty array>"]
   }
 }
 
+FEELING LAYER — comes LAST, after every coaching point above already exists:
+- This is NOT a new fault. It connects tempo/contact-quality FEEL (thin/fat contact, rushed tempo, timing) to the mechanical faults you already wrote about above — causally, using their actual titles/descriptions as reference.
+- Pattern: "<feel/contact symptom> is what's happening because of <mechanical fault you already named>" — e.g. "That quick tempo and early release ('casting') is what's causing the ball-then-ground contact instead of ball-then-turf." Don't just restate a fault in different words — draw the causal line from cause (mechanics above) to effect (the feel/contact outcome).
+- Only include this section if the video or the player's feel profile actually shows a tempo/contact symptom connected to a fault you already flagged. If there's nothing genuine to connect, OMIT the "feelingLayer" key entirely — do not invent a connection.
+
 CRITICAL RULES:
 • coachingPoints: 4–7 entries total — exactly 2 strengths, exactly 2 priority fixes, 0–3 extra observations
 • Every frameIndex must be a real index from the map (0–${swingFrames.length - 1})
 • Every timestamp must be the exact value from the map
 • Strengths: omit title, description, proRef, feelingCue, feelingCueCredit, practiceDrill, youtubeSearch
-• Priority fixes (focus-area): populate ALL fields including youtubeSearch
+• Priority fixes (focus-area): feelingCue is always required. practiceDrill and youtubeSearch are OPTIONAL per the MEDIA JUDGMENT rule above — omit both for simple one-cue fixes, include what's useful for mechanically complex faults
 • Extra observations: title + description only — no proRef/feelingCue/practiceDrill/youtubeSearch
+• feelingLayer is OPTIONAL — omit entirely if there's no genuine causal connection to draw
 • Do not include null values — just omit the field
-• Be concise: descriptions under 100 words, feelingCues under 50 words`,
+• Be concise: descriptions under 100 words, feelingCues under 50 words, feelingLayer narrative under 60 words`,
     });
 
     swingFrames.forEach(({ base64, timestamp, index }) => {
@@ -968,7 +986,7 @@ CRITICAL RULES:
 
     messageContent.push({
       type: "text",
-      text: "Return your complete coaching JSON now. Exactly 2 strengths, exactly 2 priority fixes (focus-area, fully populated with proRef/feelingCue/practiceDrill/youtubeSearch), and 0–3 extra observations (title + description only). Use exact frameIndex and timestamp values from the map. Keep descriptions under 100 words and feelingCues under 50 words.",
+      text: "Return your complete coaching JSON now. Exactly 2 strengths, exactly 2 priority fixes (focus-area, with proRef+feelingCue always, practiceDrill/youtubeSearch only when the fault is mechanically complex enough to need them), and 0–3 extra observations (title + description only). Add feelingLayer only if there's a genuine causal connection to draw — omit it otherwise. Write every observation/description in a narrative, upbeat, concise voice — not clinical bullet fragments. Use exact frameIndex and timestamp values from the map. Keep descriptions under 100 words, feelingCues under 50 words, feelingLayer narrative under 60 words.",
     });
 
     req.log.info({ frames: swingFrames.length }, "Pass 3: sending to Claude");
@@ -1086,6 +1104,7 @@ CRITICAL RULES:
       feelingCueCredit?: string;
       practiceDrill?: { name: string; description: string; reps: string };
       youtubeSearch?: { query: string; channel: string };
+      severity?: "green" | "yellow" | "red";
     };
 
     // Defensive: Claude's salvaged JSON has been observed to return
@@ -1131,6 +1150,18 @@ CRITICAL RULES:
       }
     }
 
+    // ── severity derivation ──
+    // Frontend checkpoint bar needs a 3-state color (green/yellow/red) per
+    // coaching point for its dots. We already have `status`, which is a
+    // reasonable proxy — derive severity from it here rather than asking
+    // Claude for a redundant field (no extra model call, no extra tokens).
+    for (const cp of coachingPoints) {
+      cp.severity =
+        cp.status === "strength"          ? "green"
+        : cp.status === "extra-observation" ? "yellow"
+        : "red"; // focus-area — the two priority fixes
+    }
+
     const fixes = coachingPoints
       .filter((p) => p.status !== "strength")
       .sort((a, b) => (a.coachingPriority ?? 99) - (b.coachingPriority ?? 99))
@@ -1155,6 +1186,7 @@ CRITICAL RULES:
           feelingCueCredit:p.feelingCueCredit,
           practiceDrill:   p.practiceDrill,
           youtubeSearch:   p.youtubeSearch,
+          severity:        p.severity,
         };
       });
 

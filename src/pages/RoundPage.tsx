@@ -133,32 +133,50 @@ export default function RoundPage({ onFeelSaved, onRoundSaved }: Props) {
 
   // Load initial courses on mount
   useEffect(() => {
-    fetch("/api/courses?q=")
+    const ctrl = new AbortController();
+    fetch("/api/courses?q=", { signal: ctrl.signal })
       .then(r => r.json())
       .then((d: { courses: CourseResult[] }) => setSearchResults(d.courses ?? []))
       .catch(() => {});
+    return () => ctrl.abort();
   }, []);
 
-  // Live search
+  // Live search — every new query aborts the previous in-flight fetch so a
+  // slow stale response can't overwrite the latest results.
   useEffect(() => {
+    const ctrl = new AbortController();
     if (debouncedSearch.length < 2) {
-      fetch("/api/courses?q=")
+      fetch("/api/courses?q=", { signal: ctrl.signal })
         .then(r => r.json())
         .then((d: { courses: CourseResult[] }) => setSearchResults(d.courses ?? []))
         .catch(() => {});
-      return;
+      return () => ctrl.abort();
     }
     setSearching(true);
-    fetch(`/api/courses?q=${encodeURIComponent(debouncedSearch)}`)
+    fetch(`/api/courses?q=${encodeURIComponent(debouncedSearch)}`, { signal: ctrl.signal })
       .then(r => r.json())
       .then((d: { courses: CourseResult[] }) => setSearchResults(d.courses ?? []))
-      .catch(() => {})
-      .finally(() => setSearching(false));
+      .catch((e: unknown) => {
+        // AbortError is expected when the query changes mid-flight — swallow it.
+        // For real failures (API down, network error), clear results so the
+        // user sees the empty-state UI instead of stale prior matches.
+        if ((e as { name?: string })?.name !== "AbortError") {
+          setSearchResults([]);
+        }
+      })
+      .finally(() => {
+        if (!ctrl.signal.aborted) setSearching(false);
+      });
+    return () => ctrl.abort();
   }, [debouncedSearch]);
 
   const getHolePar = useCallback((holeNum: number): number => {
-    if (selected?.holes?.length >= 18) return selected.holes[holeNum - 1].par;
-    return 4;
+    // Look up the per-hole par from whatever the course actually shipped —
+    // some external API courses arrive with partial hole data (e.g. only
+    // 9 of 18). Falling back to 4 only when the specific hole isn't there
+    // beats discarding all real par data when length < 18.
+    const h = selected?.holes?.[holeNum - 1];
+    return typeof h?.par === "number" ? h.par : 4;
   }, [selected]);
 
   const getHoleDist = useCallback((holeNum: number): number | null => {
@@ -253,7 +271,15 @@ export default function RoundPage({ onFeelSaved, onRoundSaved }: Props) {
   const saveFeelProfile = () => {
     const now = new Date().toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" });
     const entry = { date: now, shotShape: shotShape ?? "", contact: contact ?? "", customFeels };
-    const existing: FeelProfile = JSON.parse(localStorage.getItem("ciq_feel_profile") || "null") || { shotShape: "", contact: "", customFeels: "", lastUpdated: "", history: [] };
+    // Read prior profile defensively — corrupted localStorage (manual edits,
+    // truncated quota writes) was previously throwing here and killing the
+    // entire feel-save flow before the round could be persisted.
+    const blank: FeelProfile = { shotShape: "", contact: "", customFeels: "", lastUpdated: "", history: [] };
+    let existing: FeelProfile = blank;
+    try {
+      const raw = localStorage.getItem("ciq_feel_profile");
+      if (raw) existing = (JSON.parse(raw) as FeelProfile) || blank;
+    } catch { existing = blank; }
     const profile: FeelProfile = {
       shotShape: shotShape ?? "", contact: contact ?? "", customFeels,
       lastUpdated: now, history: [entry, ...(existing.history ?? [])].slice(0, 10),

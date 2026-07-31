@@ -10,3 +10,6 @@ api-server/dist/
 *.zip
 Caddy-Iq.zip
 caddyiq.zip
+
+# Claude Code internal settings — not needed in repo
+.claude/

@@ -1,15 +1,15 @@
-import { useState, useRef, useCallback } from "react";
+import { useState, useRef, useCallback, useEffect } from "react";
 import { C, F } from "../design";
-import VideoPlayer, { type MarkedPosition, type VideoPlayerHandle } from "../components/VideoPlayer";
+import VideoPlayer, { type VideoPlayerHandle } from "../components/VideoPlayer";
 import type {
   SessionMemory,
   FeelProfile,
   AnalysisResult,
   CoachingPoint,
   CheckinResponse,
-  SelectedFrame,
 } from "../App";
 import { computeCareerSummary, formatAnalyticsForPrompt, type Round } from "../lib/analytics";
+import { buildCheckpoints, type Checkpoint, type Severity } from "../lib/swingPhases";
 
 // ─── Loading state ────────────────────────────────────────────────────────────
 // Time-based progress messages so the user sees real forward motion during
@@ -42,7 +42,7 @@ interface Props {
   onSwitchTab: (t: "round" | "analyze" | "sessions" | "drills" | "analytics") => void;
 }
 
-// ─── Frame lookup helper (CHANGE 2) ───────────────────────────────────────────
+// ─── Frame lookup helper ───────────────────────────────────────────────────
 
 /** Look up a frame by exact frameIndex; if missing or out of range, return the
  * closest available frame by timestamp. Guarantees a real image rather than a
@@ -56,7 +56,6 @@ function resolveFrame(
   if (frameIndex >= 0 && frameIndex < frameImages.length) {
     return frameImages[frameIndex];
   }
-  // Fallback: closest frame by timestamp if provided, else clamp to range.
   if (typeof timestamp === "number") {
     let best = frameImages[0];
     let bestDelta = Math.abs((best.timestamp ?? 0) - timestamp);
@@ -68,6 +67,10 @@ function resolveFrame(
   }
   const clamped = Math.max(0, Math.min(frameImages.length - 1, frameIndex));
   return frameImages[clamped] ?? null;
+}
+
+function severityColor(s: Severity): string {
+  return s === "red" ? C.danger : s === "yellow" ? C.warning : C.accentGreen;
 }
 
 // ─── Shared sub-components ────────────────────────────────────────────────────
@@ -100,227 +103,184 @@ function SectionLabel({ children }: { children: React.ReactNode }) {
   );
 }
 
-// ─── Strength card (compact — no image) ──────────────────────────────────────
+// ─── Checkpoint bar — persistent, below video ─────────────────────────────────
+// Always shows all 6 phases. Tapping a dot seeks the video (if that phase has
+// a mapped moment) and opens the breakdown panel scrolled to that section.
+// Swipe-up (or tap the affordance row) opens the panel at the top.
 
-function StrengthCard({ point }: { point: CoachingPoint }) {
+function CheckpointBar({
+  checkpoints,
+  onTapDot,
+  onOpenPanel,
+}: {
+  checkpoints: Checkpoint[];
+  onTapDot: (i: number) => void;
+  onOpenPanel: () => void;
+}) {
+  const dragStartY = useRef<number | null>(null);
+
   return (
-    <div style={{
-      display: "flex", gap: 10, alignItems: "flex-start",
-      border: `1px solid #B7D9BE`, borderRadius: 10, padding: "11px 14px",
-      background: C.lightGreen, marginBottom: 8,
-    }}>
-      <span style={{ color: C.accentGreen, fontSize: 16, flexShrink: 0, marginTop: 1 }}>✓</span>
-      <div>
-        <div style={{ fontSize: 12, fontWeight: 700, color: C.accentGreen, marginBottom: 2 }}>
-          {point.positionLabel}
-        </div>
-        <div style={{ fontSize: 13, color: C.secondary, lineHeight: 1.6 }}>
-          {point.observation}
-        </div>
+    <div
+      onPointerDown={(e) => { dragStartY.current = e.clientY; }}
+      onPointerMove={(e) => {
+        if (dragStartY.current === null) return;
+        if (dragStartY.current - e.clientY > 28) {
+          onOpenPanel();
+          dragStartY.current = null;
+        }
+      }}
+      onPointerUp={() => { dragStartY.current = null; }}
+      onPointerCancel={() => { dragStartY.current = null; }}
+      style={{
+        border: `1px solid ${C.border}`, borderRadius: 12, background: C.card,
+        padding: "12px 6px 0", marginTop: 14, touchAction: "pan-y",
+      }}
+    >
+      <div style={{ display: "flex", justifyContent: "space-between" }}>
+        {checkpoints.map((cp, i) => (
+          <button
+            key={cp.phase}
+            onClick={() => onTapDot(i)}
+            style={{
+              flex: 1, display: "flex", flexDirection: "column", alignItems: "center",
+              gap: 5, border: "none", background: "transparent", cursor: "pointer",
+              padding: "2px 0 10px",
+            }}
+          >
+            <span style={{
+              width: 10, height: 10, borderRadius: "50%",
+              background: severityColor(cp.severity),
+            }} />
+            <span style={{ fontSize: 10, color: C.muted, textAlign: "center" as const, lineHeight: 1.2 }}>
+              {cp.phase}
+            </span>
+          </button>
+        ))}
+      </div>
+      <div
+        onClick={onOpenPanel}
+        style={{
+          textAlign: "center" as const, fontSize: 11, color: C.muted,
+          padding: "7px 0", cursor: "pointer", borderTop: `1px solid ${C.border}`,
+        }}
+      >
+        ︿ Swipe up for full breakdown
       </div>
     </div>
   );
 }
 
-// ─── Fix / observation card ───────────────────────────────────────────────────
+// ─── Breakdown section — one per checkpoint, inside the swipe-up panel ────────
 
-function FixCard({
-  point,
+function BreakdownSection({
+  checkpoint,
   frameImages,
-  cardRef,
   onSeek,
 }: {
-  point: CoachingPoint;
+  checkpoint: Checkpoint;
   frameImages: AnalysisResult["frameImages"];
-  cardRef?: (el: HTMLDivElement | null) => void;
-  /** Called when the user taps the frame image or position label —
-   * tells the page-level video player to seek to this card's moment. */
-  onSeek?: (timestamp: number) => void;
+  onSeek: (t: number) => void;
 }) {
-  const isExtra = point.status === "extra-observation";
-  const accent  = isExtra ? "#5C5445" : C.warning;
-  const badge   = isExtra ? "Key Observation" : "Priority Fix";
-
-  const frame = resolveFrame(frameImages, point.frameIndex, point.timestamp);
-  const ytQuery = point.youtubeSearch?.query
-    ? encodeURIComponent(point.youtubeSearch.query)
-    : null;
-  const seekHere = () => {
-    if (onSeek && typeof point.timestamp === "number") onSeek(point.timestamp);
-  };
+  const sevColor = severityColor(checkpoint.severity);
 
   return (
-    <Card
-      style={{ marginBottom: 14, borderTop: `3px solid ${accent}` }}
-    >
-      {/* Ref anchor */}
-      <div ref={cardRef} />
-
-      {/* 1. Priority badge + position label + timestamp */}
-      <div style={{
-        display: "flex", justifyContent: "space-between",
-        alignItems: "flex-start", marginBottom: 10,
-      }}>
-        <div style={{
-          fontSize: 11, fontWeight: 700, color: accent,
-          textTransform: "uppercase" as const, letterSpacing: "0.08em",
-        }}>
-          {badge}
-        </div>
-        <div
-          style={{
-            fontSize: 11, color: C.muted, textAlign: "right" as const,
-            cursor: onSeek ? "pointer" : "default",
-            textDecoration: onSeek ? "underline dotted" : "none",
-          }}
-          onClick={seekHere}
-          title={onSeek ? "Tap to jump video to this moment" : undefined}
-        >
-          {point.positionLabel}
-          {point.timestamp != null ? ` · ${point.timestamp.toFixed(1)}s` : ""}
-        </div>
+    <div style={{ padding: "18px 0", borderBottom: `1px solid ${C.border}` }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 10 }}>
+        <span style={{ width: 9, height: 9, borderRadius: "50%", background: sevColor, flexShrink: 0 }} />
+        <div style={{ fontFamily: F.serif, fontSize: 17, color: C.deepGreen }}>{checkpoint.phase}</div>
       </div>
 
-      {/* 2. Fix title */}
-      {point.title && (
-        <div style={{
-          fontFamily: F.serif, fontSize: 17, color: C.deepGreen,
-          marginBottom: 8, lineHeight: 1.3,
-        }}>
-          {point.title}
+      {checkpoint.points.length === 0 ? (
+        <div style={{ fontSize: 14, color: C.secondary, lineHeight: 1.7 }}>
+          Nothing to flag here — solid position.
         </div>
-      )}
+      ) : (
+        checkpoint.points.map((p: CoachingPoint, i: number) => {
+          const frame = resolveFrame(frameImages, p.frameIndex, p.timestamp);
+          const ytQuery = p.youtubeSearch?.query ? encodeURIComponent(p.youtubeSearch.query) : null;
+          const bodyText = p.status === "strength" ? p.observation : (p.description || p.observation);
+          const isLast = i === checkpoint.points.length - 1;
 
-      {/* 3. Frame — tap to seek video to this exact timestamp */}
-      {frame && (
-        <div
-          style={{
-            lineHeight: 0, borderRadius: 8, overflow: "hidden",
-            marginBottom: 14, cursor: onSeek ? "pointer" : "default",
-          }}
-          onClick={seekHere}
-          title={onSeek ? "Tap to jump video to this frame" : undefined}
-        >
-          <img
-            src={`data:image/jpeg;base64,${frame.base64}`}
-            alt={`${point.positionLabel} — frame at ${point.timestamp?.toFixed(2)}s`}
-            style={{ width: "100%", display: "block" }}
-          />
-        </div>
-      )}
+          return (
+            <div key={i} style={{ marginBottom: isLast ? 0 : 16 }}>
+              {p.title && (
+                <div style={{
+                  fontSize: 14, fontWeight: 700, marginBottom: 4,
+                  color: p.status === "strength" ? C.accentGreen : C.deepGreen,
+                }}>
+                  {p.title}
+                </div>
+              )}
 
-      {/* 4. Description */}
-      {point.description && (
-        <div style={{ fontSize: 14, color: C.secondary, lineHeight: 1.7, marginBottom: 14 }}>
-          {point.description}
-        </div>
-      )}
+              {bodyText && (
+                <div style={{
+                  fontSize: 15, color: C.secondary, lineHeight: 1.7,
+                  marginBottom: (frame || p.feelingCue || p.practiceDrill || ytQuery) ? 10 : 0,
+                }}>
+                  {bodyText}
+                </div>
+              )}
 
-      {/* Pro reference */}
-      {point.proRef?.player && (
-        <div style={{
-          background: C.lightGreen, borderRadius: 10,
-          padding: "12px 14px", marginBottom: 12,
-          borderLeft: `3px solid ${C.accentGreen}`,
-        }}>
-          <div style={{ fontSize: 13, fontWeight: 600, color: C.deepGreen, marginBottom: 3 }}>
-            {point.proRef.player}
-          </div>
-          <div style={{ fontSize: 13, color: C.secondary, lineHeight: 1.55 }}>
-            {point.proRef.comparison}
-          </div>
-        </div>
-      )}
+              {frame && (
+                <div
+                  onClick={() => onSeek(p.timestamp)}
+                  title="Tap to jump video to this frame"
+                  style={{
+                    lineHeight: 0, borderRadius: 8, overflow: "hidden",
+                    marginBottom: 10, cursor: "pointer", maxWidth: 240,
+                  }}
+                >
+                  <img
+                    src={`data:image/jpeg;base64,${frame.base64}`}
+                    alt={`${checkpoint.phase} — ${p.timestamp?.toFixed(2)}s`}
+                    style={{ width: "100%", display: "block" }}
+                  />
+                </div>
+              )}
 
-      {/* 5. Feeling cue */}
-      {point.feelingCue && (
-        <div style={{
-          background: C.deepGreen, borderRadius: 10,
-          padding: "14px 16px", marginBottom: 12,
-        }}>
-          <div style={{
-            fontSize: 10, fontWeight: 600, color: "rgba(255,255,255,0.5)",
-            textTransform: "uppercase" as const, letterSpacing: "0.1em", marginBottom: 6,
-          }}>
-            Feeling cue
-          </div>
-          <div style={{
-            fontSize: 14, color: "rgba(255,255,255,0.9)", lineHeight: 1.65,
-            fontStyle: "italic", fontFamily: F.serif,
-            marginBottom: point.feelingCueCredit ? 10 : 0,
-          }}>
-            "{point.feelingCue}"
-          </div>
-          {point.feelingCueCredit && (
-            <div style={{ fontSize: 11, color: "rgba(255,255,255,0.45)", lineHeight: 1.5 }}>
-              {point.feelingCueCredit}
+              {p.feelingCue && (
+                <div style={{
+                  fontSize: 14, color: C.deepGreen, fontStyle: "italic" as const,
+                  fontFamily: F.serif, lineHeight: 1.6, marginBottom: 6,
+                  borderLeft: `2px solid ${C.accentGreen}`, paddingLeft: 10,
+                }}>
+                  "{p.feelingCue}"
+                  {p.feelingCueCredit && (
+                    <div style={{
+                      fontSize: 11, color: C.muted, fontStyle: "normal" as const,
+                      fontFamily: F.sans, marginTop: 3,
+                    }}>
+                      {p.feelingCueCredit}
+                    </div>
+                  )}
+                </div>
+              )}
+
+              {p.practiceDrill && (
+                <div style={{
+                  fontSize: 13, color: C.secondary, lineHeight: 1.6,
+                  marginBottom: ytQuery ? 6 : 0,
+                }}>
+                  <span style={{ fontWeight: 700, color: C.deepGreen }}>{p.practiceDrill.name}</span>
+                  {p.practiceDrill.reps ? ` — ${p.practiceDrill.reps}` : ""}
+                  {p.practiceDrill.description ? `: ${p.practiceDrill.description}` : ""}
+                </div>
+              )}
+
+              {ytQuery && (
+                <a
+                  href={`https://www.youtube.com/results?search_query=${ytQuery}`}
+                  target="_blank" rel="noopener noreferrer"
+                  style={{ fontSize: 13, fontWeight: 600, color: C.accentGreen, textDecoration: "none" }}
+                >
+                  Watch on YouTube →
+                </a>
+              )}
             </div>
-          )}
-        </div>
+          );
+        })
       )}
-
-      {/* Practice drill */}
-      {point.practiceDrill && (
-        <div style={{
-          background: C.lightGreen, borderRadius: 10,
-          padding: "14px 16px", border: "1px solid #B7D9BE",
-          marginBottom: ytQuery ? 10 : 0,
-        }}>
-          <div style={{
-            fontSize: 10, fontWeight: 600, color: C.accentGreen,
-            textTransform: "uppercase" as const, letterSpacing: "0.08em", marginBottom: 8,
-          }}>
-            Practice drill
-          </div>
-          <div style={{ fontFamily: F.serif, fontSize: 15, color: C.deepGreen, marginBottom: 2 }}>
-            {point.practiceDrill.name}
-            <span style={{
-              fontFamily: F.sans, fontSize: 12, fontWeight: 500,
-              color: C.muted, marginLeft: 8,
-            }}>
-              {point.practiceDrill.reps}
-            </span>
-          </div>
-          <div style={{ fontSize: 13, color: C.secondary, lineHeight: 1.6 }}>
-            {point.practiceDrill.description}
-          </div>
-        </div>
-      )}
-
-      {/* 6. YouTube drill */}
-      {ytQuery && (
-        <a
-          href={`https://www.youtube.com/results?search_query=${ytQuery}`}
-          target="_blank" rel="noopener noreferrer"
-          style={{
-            display: "flex", alignItems: "center", gap: 10,
-            textDecoration: "none",
-            border: `1px solid ${C.border}`, borderRadius: 8,
-            padding: "11px 14px",
-          }}
-        >
-          <div style={{ flex: 1 }}>
-            <div style={{ fontSize: 12, color: C.muted, marginBottom: 2 }}>
-              Recommended drill
-            </div>
-            <div style={{ fontSize: 13, fontWeight: 600, color: C.deepGreen }}>
-              {point.youtubeSearch?.query}
-            </div>
-            {point.youtubeSearch?.channel && (
-              <div style={{ fontSize: 12, color: C.muted, marginTop: 1 }}>
-                {point.youtubeSearch.channel}
-              </div>
-            )}
-          </div>
-          <div style={{
-            flexShrink: 0, fontSize: 12, fontWeight: 600, color: C.accentGreen,
-            border: `1px solid ${C.accentGreen}`, padding: "5px 10px", borderRadius: 6,
-          }}>
-            Watch on YouTube
-          </div>
-        </a>
-      )}
-    </Card>
+    </div>
   );
 }
 
@@ -345,12 +305,29 @@ export default function AnalyzePage({
   const [dragging,    setDragging]    = useState(false);
   const [checkinDone, setCheckinDone] = useState(false);
   const fileRef     = useRef<HTMLInputElement>(null);
-  // Refs keyed by coaching point index (in sorted order) for scroll-to
-  const cardRefs    = useRef<Map<number, HTMLDivElement>>(new Map());
-  // Imperative handle on the video player so coaching cards can seek the video
+
+  // Swipe-up breakdown panel state
+  const [panelOpen,     setPanelOpen]     = useState(false);
+  const [panelScrollTo, setPanelScrollTo] = useState<number | null>(null);
+  const sectionRefs = useRef<Map<number, HTMLDivElement>>(new Map());
+
+  // Imperative handle on the video player so the checkpoint bar can seek the video
   const playerRef   = useRef<VideoPlayerHandle>(null);
   const seekVideo = useCallback((t: number) => {
     playerRef.current?.seekTo(t);
+  }, []);
+
+  useEffect(() => {
+    if (panelOpen && panelScrollTo !== null) {
+      const el = sectionRefs.current.get(panelScrollTo);
+      if (el) el.scrollIntoView({ behavior: "smooth", block: "start" });
+      setPanelScrollTo(null);
+    }
+  }, [panelOpen, panelScrollTo]);
+
+  const openPanel = useCallback((scrollToIdx: number | null) => {
+    setPanelOpen(true);
+    setPanelScrollTo(scrollToIdx);
   }, []);
 
   const handleFile = useCallback(
@@ -475,6 +452,7 @@ export default function AnalyzePage({
 
       const a: AnalysisResult = data.analysis as AnalysisResult;
       setResult(a);
+      setPanelOpen(false);
 
       // ── Save to session history (unchanged) ──
       onSessionSaved({
@@ -497,17 +475,7 @@ export default function AnalyzePage({
     }
   };
 
-  const reset = () => { removeFile(); setNotes(""); setLoadStep(0); };
-
-  // ── Scroll coaching card into view when thumbnail is tapped ──
-  const handleFrameClick = useCallback((pointIndex: number) => {
-    const el = cardRefs.current.get(pointIndex);
-    if (el) {
-      el.scrollIntoView({ behavior: "smooth", block: "center" });
-      el.style.animation = "highlightFade 1.2s ease";
-      setTimeout(() => { if (el) el.style.animation = ""; }, 1300);
-    }
-  }, []);
+  const reset = () => { removeFile(); setNotes(""); setLoadStep(0); setPanelOpen(false); };
 
   // ── UPLOAD VIEW ───────────────────────────────────────────────────────────
 
@@ -756,186 +724,149 @@ export default function AnalyzePage({
   if (!result) return null;
 
   // ── RESULTS VIEW ──────────────────────────────────────────────────────────
+  // Video-first: header is a single compact block, the video is the primary
+  // element on the page, a persistent checkpoint bar sits directly below it,
+  // and the full narrative breakdown lives in a swipe-up panel so it never
+  // competes with the video for attention until the user asks for it.
 
   const frameImages   = result.frameImages ?? [];
   const coachingPoints: CoachingPoint[] = result.coachingPoints ?? [];
+  const checkpoints = buildCheckpoints(coachingPoints);
 
-  // Sort all coaching points by priority (lower = more urgent)
-  const sortedPoints = [...coachingPoints].sort(
-    (a, b) => (a.coachingPriority ?? 99) - (b.coachingPriority ?? 99),
-  );
-
-  const strengths = sortedPoints.filter((p) => p.status === "strength");
-  const fixes     = sortedPoints.filter((p) => p.status !== "strength");
-
-  // Build selectedFrames for VideoPlayer thumbnail strip (ordered by timestamp)
-  const selectedFrames: SelectedFrame[] = [...coachingPoints]
-    .sort((a, b) => a.timestamp - b.timestamp)
-    .map((cp) => {
-      const img = resolveFrame(frameImages, cp.frameIndex, cp.timestamp);
-      const short = cp.positionLabel.split(" ")[0] || cp.positionLabel;
-      return {
-        base64:     img?.base64 ?? "",
-        timestamp:  cp.timestamp,
-        shortLabel: short,
-        fullLabel:  cp.positionLabel,
-        status:     cp.status,
-        pointIndex: coachingPoints.indexOf(cp),
-      };
-    });
-
-  // MarkedPositions for timeline dots (all coaching points)
-  const markedPositions: MarkedPosition[] = coachingPoints.map((cp) => ({
-    position:  cp.positionLabel.split(" ")[0] || cp.positionLabel,
-    label:     cp.positionLabel,
-    timestamp: cp.timestamp,
-    status:    cp.status,
-    coachNote: cp.observation,
-  }));
+  const handleCheckpointTap = (i: number) => {
+    const cp = checkpoints[i];
+    if (cp.timestamp !== null) seekVideo(cp.timestamp);
+    openPanel(i);
+  };
 
   return (
-    <div style={{ maxWidth: 680, margin: "0 auto", padding: "0 0 24px" }}>
-      {/* Header */}
-      <div style={{ padding: "20px 16px 16px", borderBottom: `1px solid ${C.border}` }}>
+    <div style={{ maxWidth: 680, margin: "0 auto", padding: "0 0 32px" }}>
+      {/* Header — compact, no separate boxed cards competing with the video below */}
+      <div style={{ padding: "20px 16px 4px" }}>
         <div style={{ fontFamily: F.serif, fontSize: 22, color: C.deepGreen, marginBottom: 4 }}>
           {result.headline}
         </div>
-        <div style={{ fontSize: 13, color: C.muted }}>
-          {result.isVideoAnalysis
-            ? `${result.videoFramesAnalyzed} frames analyzed · swing ${result.swingStart?.toFixed(1) ?? ""}s–${result.swingEnd?.toFixed(1) ?? ""}s · ${coachingPoints.length} coaching points`
-            : "Image analyzed"}
-        </div>
-      </div>
-
-      <div style={{ padding: "16px" }}>
-
-        {/* Opening */}
-        <Card style={{ marginBottom: 20, background: C.lightGreen, border: "1px solid #B7D9BE" }}>
-          <div style={{ fontSize: 15, color: C.deepGreen, lineHeight: 1.75 }}>
+        {result.openingMessage && (
+          <div style={{ fontSize: 14, color: C.secondary, lineHeight: 1.6, marginBottom: 6 }}>
             {result.openingMessage}
           </div>
-        </Card>
+        )}
+        {result.isVideoAnalysis && (
+          <div style={{ fontSize: 12, color: C.muted }}>
+            Swing {result.swingStart?.toFixed(1) ?? ""}s–{result.swingEnd?.toFixed(1) ?? ""}s
+          </div>
+        )}
+      </div>
 
-        {/* Video player with frame strip and timeline dots */}
+      <div style={{ padding: "10px 16px 0" }}>
         {videoUrl && result.isVideoAnalysis && (
-          <div style={{ marginBottom: 24 }}>
-            <SectionLabel>Your swing</SectionLabel>
-            <Card style={{ padding: 12 }}>
-              <VideoPlayer
-                ref={playerRef}
-                videoUrl={videoUrl}
-                duration={result.videoDuration ?? 3}
-                frameTimestamps={result.frameTimestamps ?? []}
-                positions={markedPositions}
-                selectedFrames={selectedFrames}
-                onFrameClick={handleFrameClick}
-              />
-            </Card>
-          </div>
+          <VideoPlayer
+            ref={playerRef}
+            videoUrl={videoUrl}
+            duration={result.videoDuration ?? 3}
+          />
         )}
 
-        {/* What's working */}
-        {result.whatsWorking?.length > 0 && (
-          <div style={{ marginBottom: 20 }}>
-            <SectionLabel>What is working</SectionLabel>
-            <Card>
-              {result.whatsWorking.map((s, i) => (
-                <div
-                  key={i}
-                  style={{
-                    display: "flex", gap: 10, alignItems: "flex-start",
-                    paddingBottom: i < result.whatsWorking.length - 1 ? 12 : 0,
-                    borderBottom: i < result.whatsWorking.length - 1 ? `1px solid ${C.border}` : "none",
-                    marginBottom: i < result.whatsWorking.length - 1 ? 12 : 0,
-                  }}
-                >
-                  <span style={{ color: C.accentGreen, fontSize: 14, flexShrink: 0, marginTop: 2 }}>+</span>
-                  <div style={{ fontSize: 15, color: C.secondary, lineHeight: 1.6 }}>{s}</div>
+        <CheckpointBar
+          checkpoints={checkpoints}
+          onTapDot={handleCheckpointTap}
+          onOpenPanel={() => openPanel(null)}
+        />
+
+        {/* Weekly focus + closing — one compact card, kept minimal */}
+        {(result.weeklyFocus || result.closingMessage) && (
+          <div style={{ background: C.deepGreen, borderRadius: 12, padding: 18, marginTop: 20 }}>
+            {result.weeklyFocus && (
+              <>
+                <div style={{
+                  fontSize: 10, fontWeight: 600, color: "rgba(255,255,255,0.5)",
+                  textTransform: "uppercase" as const, letterSpacing: "0.1em", marginBottom: 8,
+                }}>
+                  This week's focus
                 </div>
-              ))}
-            </Card>
-          </div>
-        )}
-
-        {/* Strengths — compact cards, no image */}
-        {strengths.length > 0 && (
-          <div style={{ marginBottom: 20 }}>
-            <SectionLabel>Strengths ({strengths.length})</SectionLabel>
-            {strengths.map((p, i) => (
-              <div
-                key={i}
-                ref={(el) => {
-                  const idx = coachingPoints.indexOf(p);
-                  if (el) cardRefs.current.set(idx, el);
-                }}
-              >
-                <StrengthCard point={p} />
+                <div style={{
+                  fontFamily: F.serif, fontSize: 16, color: "#fff", lineHeight: 1.6,
+                  marginBottom: result.closingMessage ? 10 : 0,
+                }}>
+                  {result.weeklyFocus}
+                </div>
+              </>
+            )}
+            {result.closingMessage && (
+              <div style={{ fontSize: 13, color: "rgba(255,255,255,0.75)", lineHeight: 1.6, fontStyle: "italic" as const }}>
+                {result.closingMessage}
               </div>
-            ))}
+            )}
           </div>
-        )}
-
-        {/* Fix cards — ordered by coachingPriority, with annotated frames */}
-        {fixes.length > 0 && (
-          <div style={{ marginBottom: 20 }}>
-            <SectionLabel>
-              Coaching fixes — priority order ({fixes.length})
-            </SectionLabel>
-            {fixes.map((p, i) => {
-              const globalIdx = coachingPoints.indexOf(p);
-              return (
-                <FixCard
-                  key={i}
-                  point={p}
-                  frameImages={frameImages}
-                  cardRef={(el) => {
-                    if (el) cardRefs.current.set(globalIdx, el);
-                  }}
-                  onSeek={seekVideo}
-                />
-              );
-            })}
-          </div>
-        )}
-
-        {/* Weekly focus */}
-        {result.weeklyFocus && (
-          <div style={{
-            background: C.deepGreen, borderRadius: 12, padding: 20, marginBottom: 16,
-          }}>
-            <div style={{
-              fontSize: 11, fontWeight: 600, color: "rgba(255,255,255,0.5)",
-              textTransform: "uppercase" as const, letterSpacing: "0.1em", marginBottom: 10,
-            }}>
-              This week's focus
-            </div>
-            <div style={{ fontFamily: F.serif, fontSize: 17, color: "#fff", lineHeight: 1.65 }}>
-              {result.weeklyFocus}
-            </div>
-          </div>
-        )}
-
-        {/* Closing */}
-        {result.closingMessage && (
-          <Card style={{ marginBottom: 20, borderLeft: `3px solid ${C.accentGreen}` }}>
-            <div style={{
-              fontSize: 15, color: C.secondary, lineHeight: 1.75, fontStyle: "italic",
-            }}>
-              {result.closingMessage}
-            </div>
-          </Card>
         )}
 
         <button
           onClick={reset}
           style={{
-            width: "100%", padding: "13px 0",
+            width: "100%", padding: "13px 0", marginTop: 16,
             border: `1px solid ${C.border}`, borderRadius: 8,
             background: C.card, color: C.secondary, fontSize: 15, fontWeight: 600,
           }}
         >
           Analyze another swing
         </button>
+      </div>
+
+      {/* ── Swipe-up breakdown panel ── */}
+      {panelOpen && (
+        <div
+          onClick={() => setPanelOpen(false)}
+          style={{ position: "fixed", inset: 0, background: "rgba(15,36,23,0.35)", zIndex: 1100 }}
+        />
+      )}
+      <div style={{
+        position: "fixed", left: 0, right: 0, bottom: 0,
+        maxWidth: 680, margin: "0 auto",
+        height: "84vh", background: C.bg,
+        borderTopLeftRadius: 20, borderTopRightRadius: 20,
+        boxShadow: "0 -10px 30px rgba(0,0,0,0.2)",
+        transform: panelOpen ? "translateY(0)" : "translateY(100%)",
+        transition: "transform 0.28s ease",
+        zIndex: 1200, display: "flex", flexDirection: "column" as const,
+      }}>
+        <div
+          onClick={() => setPanelOpen(false)}
+          style={{ padding: "10px 0 8px", display: "flex", justifyContent: "center", cursor: "pointer" }}
+        >
+          <div style={{ width: 40, height: 4, borderRadius: 2, background: C.borderDark }} />
+        </div>
+        <div style={{
+          display: "flex", justifyContent: "space-between", alignItems: "center",
+          padding: "0 20px 14px", borderBottom: `1px solid ${C.border}`,
+        }}>
+          <div style={{ fontFamily: F.serif, fontSize: 18, color: C.deepGreen }}>Full breakdown</div>
+          <button
+            onClick={() => setPanelOpen(false)}
+            style={{ border: "none", background: "none", fontSize: 22, color: C.muted, cursor: "pointer", lineHeight: 1 }}
+          >
+            ×
+          </button>
+        </div>
+        <div style={{ flex: 1, overflowY: "auto" as const, padding: "4px 20px 32px" }}>
+          {checkpoints.map((cp, i) => (
+            <div key={cp.phase} ref={(el) => { if (el) sectionRefs.current.set(i, el); }}>
+              <BreakdownSection checkpoint={cp} frameImages={frameImages} onSeek={seekVideo} />
+            </div>
+          ))}
+
+          {/* Feeling layer — always last, connects tempo/contact feel to
+              faults already covered above in causal language. Optional. */}
+          {result.feelingLayer?.narrative && (
+            <div style={{ padding: "18px 0" }}>
+              <div style={{ fontFamily: F.serif, fontSize: 15, color: C.deepGreen, marginBottom: 8 }}>
+                How it feels
+              </div>
+              <div style={{ fontSize: 15, color: C.secondary, lineHeight: 1.75, fontStyle: "italic" as const }}>
+                {result.feelingLayer.narrative}
+              </div>
+            </div>
+          )}
+        </div>
       </div>
     </div>
   );

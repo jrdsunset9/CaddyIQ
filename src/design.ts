@@ -10,6 +10,10 @@ export const C = {
   body:        "#0F2417",
   secondary:   "#5C5445",
   warning:     "#B45309",
+  /** Severity red for the checkpoint bar's "needs work" dot — a muted
+   *  brick red consistent with the warm Club & Classic palette, distinct
+   *  from the existing amber `warning` token used for "minor issue". */
+  danger:      "#B0403A",
   cardBorder:  "1px solid #E8E4DC",
 } as const;
 

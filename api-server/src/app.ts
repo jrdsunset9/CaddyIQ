@@ -27,14 +27,17 @@ app.use(
     },
   }),
 );
-app.use(cors({
-  origin: [
-    'http://localhost:5173',
-    'http://localhost:3000',
-    process.env.FRONTEND_URL || '*',
-  ],
-  credentials: true,
-}));
+// CORS — same-origin (frontend served from this Express) doesn't need this.
+// It only matters when the frontend is on a different domain: Vite dev server,
+// a Vercel preview, iOS simulator hitting a remote backend, etc.
+//
+// `origin: true` reflects the request Origin header (NOT `*`), which is the
+// only value the browser accepts alongside `credentials: true`. When
+// FRONTEND_URL is set, we switch to a strict allow-list for production safety.
+const corsOrigin: cors.CorsOptions["origin"] = process.env.FRONTEND_URL
+  ? [process.env.FRONTEND_URL, "http://localhost:5173", "http://localhost:3000"]
+  : true;
+app.use(cors({ origin: corsOrigin, credentials: true }));
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
@@ -72,9 +75,36 @@ app.use("/api", (err: unknown, req: Request, res: Response, _next: NextFunction)
   }
 });
 
-// Serve the built React frontend (Railway: process.cwd() is the project root)
-const frontendDist = path.join(process.cwd(), "dist");
-if (fs.existsSync(frontendDist)) {
+// Serve the built React frontend if a `dist/` is available.
+//
+// Deploy topologies we need to support without surgery:
+//   - Railway / Replit with cwd = `api-server/` → dist at `../dist`
+//   - Local `npm start` from project root      → dist at `./dist`
+//   - Future iOS-only backend (no frontend)    → no dist, just API
+//   - Frontend hosted separately on Vercel     → set FRONTEND_DIST=""
+//
+// FRONTEND_DIST env var is the explicit override; otherwise we probe
+// candidates in order and require `index.html` to exist (so a stray empty
+// `dist/` directory doesn't trick the SPA fallback into serving 404s).
+function resolveFrontendDist(): string | null {
+  const override = process.env.FRONTEND_DIST;
+  if (override !== undefined) {
+    if (override === "") return null; // explicit opt-out (API-only mode)
+    const resolved = path.resolve(override);
+    return fs.existsSync(path.join(resolved, "index.html")) ? resolved : null;
+  }
+  const candidates = [
+    path.join(process.cwd(), "dist"),
+    path.join(process.cwd(), "..", "dist"),
+  ];
+  for (const c of candidates) {
+    if (fs.existsSync(path.join(c, "index.html"))) return c;
+  }
+  return null;
+}
+
+const frontendDist = resolveFrontendDist();
+if (frontendDist) {
   app.use(express.static(frontendDist));
   // SPA fallback — send index.html for any non-API GET (and HEAD, which
   // health checkers and link prefetchers use). Express 5's path-to-regexp
@@ -87,7 +117,10 @@ if (fs.existsSync(frontendDist)) {
   });
   logger.info({ frontendDist }, "Serving frontend static files");
 } else {
-  logger.warn({ frontendDist }, "Frontend dist not found — run 'npm run build' first");
+  logger.info(
+    "Frontend dist not found — running in API-only mode. " +
+    "Set FRONTEND_DIST or run 'npm run build' from the project root.",
+  );
 }
 
 export default app;

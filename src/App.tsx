@@ -32,6 +32,9 @@ export interface CoachingPoint {
   status: "strength" | "focus-area" | "extra-observation";
   observation: string;
   coachingPriority: number;        // lower = fix first; strengths get 20+
+  /** Server-derived 3-state color for the checkpoint bar dots.
+   *  strength→green, extra-observation→yellow, focus-area→red. */
+  severity?: "green" | "yellow" | "red";
   // Fix-only fields (omitted for strengths):
   title?: string;
   description?: string;
@@ -42,14 +45,11 @@ export interface CoachingPoint {
   youtubeSearch?: { query: string; channel: string };
 }
 
-/** A coaching-point frame enriched for the VideoPlayer thumbnail strip. */
-export interface SelectedFrame {
-  base64: string;
-  timestamp: number;
-  shortLabel: string;   // "P4" or "Grip"
-  fullLabel: string;    // "P4 — Top of backswing" or "Grip fault — Address"
-  status: "strength" | "focus-area" | "extra-observation";
-  pointIndex: number;   // index into coachingPoints[] array
+/** Closing section connecting feel (tempo/contact) to faults already
+ * identified above, in causal language. Optional — the model omits it
+ * when there's no genuine connection to draw. */
+export interface FeelingLayer {
+  narrative: string;
 }
 
 export interface AnalysisResult {
@@ -72,9 +72,14 @@ export interface AnalysisResult {
     feelingCueCredit?: string;
     practiceDrill?: { name: string; description: string; reps: string };
     youtubeSearch?: { query: string; channel: string };
+    severity?: "green" | "yellow" | "red";
   }>;
   weeklyFocus: string;
   closingMessage: string;
+  /** Optional narrative connecting feel/contact symptoms to faults already
+   * identified elsewhere in coachingPoints. Rendered as the final section
+   * of the swipe-up breakdown panel, after all checkpoint critiques. */
+  feelingLayer?: FeelingLayer;
   sessionSummary: { faultsIdentified: string[]; improvementsNoted: string[] };
   videoFramesAnalyzed: number;
   isVideoAnalysis: boolean;

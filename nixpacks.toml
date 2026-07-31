@@ -1,11 +1,11 @@
 [phases.setup]
-nixPkgs = ["nodejs_20", "ffmpeg"]
-
-[phases.install]
-cmds = ["npm install", "cd api-server && npm install"]
+nixPkgs = ["ffmpeg", "nodejs_20"]
 
 [phases.build]
-cmds = ["npm run build"]
+cmds = [
+  "cd api-server && npm install && npm run build"
+]
 
 [start]
-cmd = "node --import tsx/esm api-server/src/index.ts"
+cmd = "cd api-server && npm start"
+
